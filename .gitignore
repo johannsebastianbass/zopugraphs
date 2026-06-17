@@ -4,6 +4,7 @@ __pycache__/
 venv/
 
 # Segredos e dados locais (NUNCA versionar)
+.env
 .streamlit/secrets.toml
 zopu.db
 zopu.db-wal

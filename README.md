@@ -38,6 +38,14 @@ python manage.py passwd --username master --password NOVA   # trocar senha
 
 > As senhas reais desta instalação foram entregues à parte (fora do Git).
 
+## Setup rápido em uma máquina nova
+```bash
+cp .env.example .env      # preencha MASTER_PASS, TENANT_NAME, BITRIX_WEBHOOK...
+python bootstrap.py       # cria banco, master, ambiente e roda a 1ª carga
+# Windows: basta dar duplo clique em setup.bat (instala deps + bootstrap)
+```
+O `bootstrap.py` é idempotente — o que já existe é preservado.
+
 ## Como rodar o painel
 ```bash
 pip install -r requirements.txt

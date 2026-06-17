@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Segredos e dados locais (NUNCA versionar)
+.streamlit/secrets.toml
+zopu.db
+zopu.db-wal
+zopu.db-shm
+*.log
+
+_probe/
+.cache/

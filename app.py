@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -20,7 +21,11 @@ import auth
 import db
 from sync import sync_tenant, _spa_list
 
-st.set_page_config(page_title="Painel Comercial ZOPU", page_icon="📊", layout="wide")
+LOGO = str(Path(__file__).parent / "assets" / "fluidz_logo.svg")
+APP_NAME = "Fluidz Graphs"
+
+st.set_page_config(page_title=APP_NAME, page_icon=LOGO, layout="wide")
+st.logo(LOGO, size="large")
 
 PALETTE = px.colors.qualitative.Bold
 WON_COLOR, LOST_COLOR, OPEN_COLOR, META_COLOR = "#16a34a", "#dc2626", "#2563eb", "#f59e0b"
@@ -147,7 +152,9 @@ def dim_bar(container, df, col, title, color=None, top=15):
 
 # ====================================================================== login
 def render_login():
-    st.title("📊 Painel Comercial ZOPU")
+    col = st.columns([1, 5])
+    col[0].image(LOGO, width=84)
+    col[1].title(APP_NAME)
     st.caption("Acesse com as credenciais fornecidas pela ZOPU.")
     with st.form("login"):
         username = st.text_input("Usuário")
@@ -929,6 +936,7 @@ def main():
     user = st.session_state.user
 
     with st.sidebar:
+        st.markdown(f"### {APP_NAME}")
         st.markdown(f"👤 **{user.get('NAME') or user['USERNAME']}**")
         st.caption("Master (ZOPU)" if user["ROLE"] == "master" else "Cliente")
         if st.button("Sair"):

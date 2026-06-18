@@ -348,6 +348,14 @@ def spa_items_df(tenant_id: int, entity_type_id: int) -> pd.DataFrame:
         )
 
 
+def clear_tenant_data(tenant_id: int) -> None:
+    """Apaga os dados sincronizados de um tenant (deals/leads/SPAs/produtos),
+    para uma recarga limpa quando registros foram removidos no Bitrix."""
+    with get_conn() as c:
+        for table in ("deals", "leads", "spa_items", "products"):
+            c.execute(f"DELETE FROM {table} WHERE TENANT_ID=?", (tenant_id,))
+
+
 def deal_ids(tenant_id: int) -> List[str]:
     with get_conn() as c:
         return [r[0] for r in c.execute("SELECT ID FROM deals WHERE TENANT_ID=?", (tenant_id,))]

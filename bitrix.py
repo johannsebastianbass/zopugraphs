@@ -117,6 +117,7 @@ class BitrixClient:
         self,
         category_id: Optional[str] = None,
         modified_since: Optional[str] = None,
+        created_since: Optional[str] = None,
         extra_select: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         select = [
@@ -129,6 +130,8 @@ class BitrixClient:
             flt["CATEGORY_ID"] = category_id
         if modified_since:
             flt[">=DATE_MODIFY"] = modified_since
+        if created_since:
+            flt[">=DATE_CREATE"] = created_since
         params: Dict[str, Any] = {"select": select}
         if flt:
             params["filter"] = flt
@@ -137,25 +140,34 @@ class BitrixClient:
     def get_leads(
         self,
         modified_since: Optional[str] = None,
+        created_since: Optional[str] = None,
         extra_select: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         select = [
             "ID", "TITLE", "STATUS_ID", "STATUS_SEMANTIC_ID", "OPPORTUNITY",
             "ASSIGNED_BY_ID", "DATE_CREATE", "DATE_MODIFY", "SOURCE_ID",
         ] + list(extra_select or [])
-        params: Dict[str, Any] = {"select": select}
+        flt: Dict[str, Any] = {}
         if modified_since:
-            params["filter"] = {">=DATE_MODIFY": modified_since}
+            flt[">=DATE_MODIFY"] = modified_since
+        if created_since:
+            flt[">=DATE_CREATE"] = created_since
+        params: Dict[str, Any] = {"select": select}
+        if flt:
+            params["filter"] = flt
         return self.call_list_by_id("crm.lead.list", params)
 
-    def get_spa_items(self, entity_type_id: int) -> List[Dict[str, Any]]:
-        """Itens de um SPA (Smart Process): reuniões, processamento de pedido,
-        pós-vendas, diárias, etc. Resposta vem em result.items (formato diferente
-        das listas clássicas). Sempre carga completa."""
+    def get_spa_items(self, entity_type_id: int,
+                      created_since: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Itens de um SPA (Smart Process): agendas, follow-ups, pós-vendas, etc.
+        Resposta vem em result.items (formato diferente das listas clássicas)."""
         results: List[Dict[str, Any]] = []
         start = 0
-        for _ in range(200):
-            data = self.call("crm.item.list", {"entityTypeId": entity_type_id, "start": start})
+        base_params: Dict[str, Any] = {"entityTypeId": entity_type_id}
+        if created_since:
+            base_params["filter"] = {">=createdTime": created_since}
+        for _ in range(400):
+            data = self.call("crm.item.list", {**base_params, "start": start})
             items = (data.get("result") or {}).get("items", []) or []
             results.extend(items)
             nxt = data.get("next")

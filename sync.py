@@ -67,7 +67,8 @@ def _resolve(value, enum_map):
     return enum_map.get(str(value), value) if enum_map else value
 
 
-def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_HOURS) -> dict:
+def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_HOURS,
+                created_since: Optional[str] = None) -> dict:
     tid = tenant["ID"]
     client = BitrixClient(tenant["WEBHOOK"])
     fmap = db.get_field_map(tid) or DEFAULT_FIELD_MAP
@@ -90,16 +91,21 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
 
     have = db.count_records(tid)
     first_load = (have["deals"] == 0 and have["leads"] == 0)
-    modified_since: Optional[str] = None if (full or first_load) else _cutoff_iso(window_hours)
+    # created_since: carga limitada por data de criação (ex.: só mês passado e atual)
+    if created_since:
+        modified_since = None
+    else:
+        modified_since = None if (full or first_load) else _cutoff_iso(window_hours)
 
     spas = _spa_list(fmap)
     try:
         deals = client.get_deals(category_id=tenant["SALES_CATEGORY_ID"],
-                                 modified_since=modified_since,
+                                 modified_since=modified_since, created_since=created_since,
                                  extra_select=list(dmap.values()))
-        leads = client.get_leads(modified_since=modified_since,
+        leads = client.get_leads(modified_since=modified_since, created_since=created_since,
                                  extra_select=list(lmap.values()))
-        spa_raw = {s["entity_type_id"]: client.get_spa_items(s["entity_type_id"]) for s in spas}
+        spa_raw = {s["entity_type_id"]: client.get_spa_items(s["entity_type_id"], created_since=created_since)
+                   for s in spas}
     except BitrixError as e:
         return {"tenant": tenant["NAME"], "ok": False, "error": str(e)}
 
@@ -124,7 +130,10 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
         ns += db.upsert_spa_items(tid, et, rows)
 
     total = db.count_records(tid)
-    mode = "completa" if modified_since is None else f"incremental({window_hours}h)"
+    if created_since:
+        mode = f"desde {created_since[:10]}"
+    else:
+        mode = "completa" if modified_since is None else f"incremental({window_hours}h)"
     db.set_sync(tid, total["deals"], total["leads"],
                 note=f"{mode}: +{nd} deals, +{nl} leads, {ns} itens SPA")
     return {

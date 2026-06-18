@@ -36,6 +36,12 @@ MEETING_COLS = [
     "ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "ASSIGNED_BY_ID", "SOURCE_ID",
     "CREATED_TIME", "BEGINDATE",
 ]
+# Itens genéricos de SPA (Smart Process), ex.: reuniões, processamento de pedido,
+# pós-vendas, diárias. Cada tenant define quais SPAs acompanha no FIELD_MAP.
+SPA_COLS = [
+    "ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "ASSIGNED_BY_ID", "SOURCE_ID",
+    "CREATED_TIME", "BEGINDATE", "OPPORTUNITY",
+]
 
 
 def get_conn() -> sqlite3.Connection:
@@ -98,6 +104,16 @@ def init_db() -> None:
                 ASSIGNED_BY_ID TEXT, SOURCE_ID TEXT,
                 CREATED_TIME TEXT, BEGINDATE TEXT,
                 PRIMARY KEY (TENANT_ID, ID)
+            );
+
+            CREATE TABLE IF NOT EXISTS spa_items (
+                TENANT_ID INTEGER NOT NULL,
+                ENTITY_TYPE_ID INTEGER NOT NULL,
+                ID TEXT NOT NULL,
+                TITLE TEXT, STAGE_ID TEXT, CATEGORY_ID TEXT,
+                ASSIGNED_BY_ID TEXT, SOURCE_ID TEXT,
+                CREATED_TIME TEXT, BEGINDATE TEXT, OPPORTUNITY REAL,
+                PRIMARY KEY (TENANT_ID, ENTITY_TYPE_ID, ID)
             );
 
             CREATE TABLE IF NOT EXISTS tenant_meta (
@@ -285,12 +301,48 @@ def upsert_meetings(tenant_id: int, rows: List[dict]) -> int:
     return _upsert("meetings", MEETING_COLS, tenant_id, rows)
 
 
+def upsert_spa_items(tenant_id: int, entity_type_id: int, rows: List[dict]) -> int:
+    if not rows:
+        return 0
+    cols = SPA_COLS
+    placeholders = ",".join(["?"] * (len(cols) + 2))  # + TENANT_ID + ENTITY_TYPE_ID
+    updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "ID")
+    sql = (
+        f"INSERT INTO spa_items (TENANT_ID,ENTITY_TYPE_ID,{','.join(cols)}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT(TENANT_ID,ENTITY_TYPE_ID,ID) DO UPDATE SET {updates}"
+    )
+    data = []
+    for r in rows:
+        vals = [tenant_id, entity_type_id]
+        for col in cols:
+            v = r.get(col)
+            if col == "OPPORTUNITY":
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    v = 0.0
+            vals.append(v)
+        data.append(vals)
+    with get_conn() as c:
+        c.executemany(sql, data)
+    return len(data)
+
+
+def spa_items_df(tenant_id: int, entity_type_id: int) -> pd.DataFrame:
+    with get_conn() as c:
+        return pd.read_sql_query(
+            f"SELECT {','.join(SPA_COLS)} FROM spa_items WHERE TENANT_ID=? AND ENTITY_TYPE_ID=?",
+            c, params=(tenant_id, entity_type_id),
+        )
+
+
 def count_records(tenant_id: int) -> Dict[str, int]:
     with get_conn() as c:
         d = c.execute("SELECT COUNT(*) FROM deals WHERE TENANT_ID=?", (tenant_id,)).fetchone()[0]
         l = c.execute("SELECT COUNT(*) FROM leads WHERE TENANT_ID=?", (tenant_id,)).fetchone()[0]
-        m = c.execute("SELECT COUNT(*) FROM meetings WHERE TENANT_ID=?", (tenant_id,)).fetchone()[0]
-    return {"deals": d, "leads": l, "meetings": m}
+        s = c.execute("SELECT COUNT(*) FROM spa_items WHERE TENANT_ID=?", (tenant_id,)).fetchone()[0]
+    return {"deals": d, "leads": l, "spa": s}
 
 
 def deals_df(tenant_id: int) -> pd.DataFrame:

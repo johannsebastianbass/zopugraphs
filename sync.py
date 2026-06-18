@@ -36,8 +36,20 @@ DEFAULT_FIELD_MAP = {
         "segmento": "UF_CRM_1753417862",
         "motivo": "UF_CRM_1769452594193",      # motivo de perda/fechamento
     },
-    "meetings_entity_type_id": 1050,
+    # SPAs (Smart Processes) acompanhados neste ambiente
+    "spas": [
+        {"entity_type_id": 1050, "label": "Reuniões", "icon": "🤝"},
+    ],
 }
+
+
+def _spa_list(fmap: dict) -> list:
+    """Lê a lista de SPAs do mapa, com compatibilidade ao formato antigo."""
+    spas = fmap.get("spas")
+    if spas:
+        return spas
+    et = fmap.get("meetings_entity_type_id")
+    return [{"entity_type_id": et, "label": "Reuniões", "icon": "🤝"}] if et else []
 
 
 def _cutoff_iso(hours: float) -> str:
@@ -80,13 +92,14 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     first_load = (have["deals"] == 0 and have["leads"] == 0)
     modified_since: Optional[str] = None if (full or first_load) else _cutoff_iso(window_hours)
 
+    spas = _spa_list(fmap)
     try:
         deals = client.get_deals(category_id=tenant["SALES_CATEGORY_ID"],
                                  modified_since=modified_since,
                                  extra_select=list(dmap.values()))
         leads = client.get_leads(modified_since=modified_since,
                                  extra_select=list(lmap.values()))
-        meetings = client.get_meetings(fmap.get("meetings_entity_type_id", 1050))
+        spa_raw = {s["entity_type_id"]: client.get_spa_items(s["entity_type_id"]) for s in spas}
     except BitrixError as e:
         return {"tenant": tenant["NAME"], "ok": False, "error": str(e)}
 
@@ -98,25 +111,27 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
         l["CARGO"] = _resolve(l.get(lmap.get("cargo")), lead_enums.get(lmap.get("cargo")))
         l["MOTIVO"] = _resolve(l.get(lmap.get("motivo")), lead_enums.get(lmap.get("motivo")))
 
-    meet_rows = [{
-        "ID": str(m.get("id")), "TITLE": m.get("title"), "STAGE_ID": m.get("stageId"),
-        "CATEGORY_ID": str(m.get("categoryId")), "ASSIGNED_BY_ID": str(m.get("assignedById")),
-        "SOURCE_ID": m.get("sourceId"), "CREATED_TIME": m.get("createdTime"),
-        "BEGINDATE": m.get("begindate"),
-    } for m in meetings]
-
     nd = db.upsert_deals(tid, deals)
     nl = db.upsert_leads(tid, leads)
-    nm = db.upsert_meetings(tid, meet_rows)
+    ns = 0
+    for et, items in spa_raw.items():
+        rows = [{
+            "ID": str(m.get("id")), "TITLE": m.get("title"), "STAGE_ID": m.get("stageId"),
+            "CATEGORY_ID": str(m.get("categoryId")), "ASSIGNED_BY_ID": str(m.get("assignedById")),
+            "SOURCE_ID": m.get("sourceId"), "CREATED_TIME": m.get("createdTime"),
+            "BEGINDATE": m.get("begindate"), "OPPORTUNITY": m.get("opportunity"),
+        } for m in items]
+        ns += db.upsert_spa_items(tid, et, rows)
+
     total = db.count_records(tid)
     mode = "completa" if modified_since is None else f"incremental({window_hours}h)"
     db.set_sync(tid, total["deals"], total["leads"],
-                note=f"{mode}: +{nd} deals, +{nl} leads, {nm} reuniões")
+                note=f"{mode}: +{nd} deals, +{nl} leads, {ns} itens SPA")
     return {
         "tenant": tenant["NAME"], "ok": True, "mode": mode,
-        "deals_upsert": nd, "leads_upsert": nl, "meetings_upsert": nm,
+        "deals_upsert": nd, "leads_upsert": nl, "spa_upsert": ns,
         "deals_total": total["deals"], "leads_total": total["leads"],
-        "meetings_total": total["meetings"],
+        "spa_total": total["spa"],
     }
 
 
@@ -142,8 +157,8 @@ def main():
     for r in sync_all(full=args.full, tenant_id=args.tenant):
         if r["ok"]:
             print(f"  [OK] {r['tenant']}: {r['mode']} | +{r['deals_upsert']} deals "
-                  f"(+{r['leads_upsert']} leads, {r['meetings_upsert']} reuniões) | totais: "
-                  f"{r['deals_total']} deals, {r['leads_total']} leads, {r['meetings_total']} reuniões")
+                  f"(+{r['leads_upsert']} leads, {r['spa_upsert']} itens SPA) | totais: "
+                  f"{r['deals_total']} deals, {r['leads_total']} leads, {r['spa_total']} itens SPA")
         else:
             print(f"  [ERRO] {r['tenant']}: {r['error']}")
 

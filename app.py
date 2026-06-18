@@ -18,7 +18,7 @@ import streamlit as st
 
 import auth
 import db
-from sync import sync_tenant
+from sync import sync_tenant, _spa_list
 
 st.set_page_config(page_title="Painel Comercial ZOPU", page_icon="📊", layout="wide")
 
@@ -60,7 +60,7 @@ def build_deals_df(df, status_map, user_map, category_id) -> pd.DataFrame:
     df["CLOSEDATE"] = to_dt(df["CLOSEDATE"])
     df["ASSIGNED_BY_ID"] = df["ASSIGNED_BY_ID"].astype(str)
     df["Vendedor"] = df["ASSIGNED_BY_ID"].map(user_map).fillna("ID " + df["ASSIGNED_BY_ID"])
-    stage_names = status_map.get(f"DEAL_STAGE_{category_id}", {})
+    stage_names = status_map.get(f"DEAL_STAGE_{category_id}") or status_map.get("DEAL_STAGE", {})
     df["Estágio"] = df["STAGE_ID"].map(stage_names).fillna(df["STAGE_ID"])
     src = status_map.get("SOURCE", {})
     df["Fonte"] = df["SOURCE_ID"].map(src).fillna(df["SOURCE_ID"]).fillna("—")
@@ -96,29 +96,30 @@ def build_leads_df(df, status_map, user_map) -> pd.DataFrame:
     return df
 
 
-def build_meetings_df(df, status_map, user_map) -> pd.DataFrame:
+def build_spa_df(df, status_map, user_map, entity_type_id) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
+    df["OPPORTUNITY"] = pd.to_numeric(df.get("OPPORTUNITY"), errors="coerce").fillna(0.0)
     df["DATE_CREATE"] = to_dt(df["CREATED_TIME"])
     df["ASSIGNED_BY_ID"] = df["ASSIGNED_BY_ID"].astype(str)
     df["Vendedor"] = df["ASSIGNED_BY_ID"].map(user_map).fillna("ID " + df["ASSIGNED_BY_ID"])
     df["Fonte"] = df["SOURCE_ID"].map(status_map.get("SOURCE", {})).fillna(df["SOURCE_ID"]).fillna("—")
     smap = {}
     for k, v in status_map.items():
-        if k.startswith("DYNAMIC_1050_STAGE_"):
+        if k.startswith(f"DYNAMIC_{entity_type_id}_STAGE_"):
             smap.update(v)
     df["Estágio"] = df["STAGE_ID"].map(smap).fillna(df["STAGE_ID"])
 
     def sit(s):
         s = str(s)
         if s.endswith(":SUCCESS"):
-            return "Participou"
+            return "Concluído"
         if s.endswith(":FAIL"):
-            return "No-show"
+            return "Insucesso"
         if s.endswith(":NEW"):
-            return "Agendada"
-        return "Outros"
+            return "Novo"
+        return "Em andamento"
 
     df["Situação"] = df["STAGE_ID"].apply(sit)
     df["Mês criação"] = df["DATE_CREATE"].dt.to_period("M").astype(str)
@@ -181,20 +182,35 @@ def maybe_autosync(tenant: dict):
 
 
 # ====================================================================== dashboard
+@st.cache_data(ttl=600, show_spinner="Carregando dados…")
+def load_frames(tenant_id: int, cat_id: str, spa_ids: tuple, cache_key: str):
+    """Carrega e processa deals/leads/SPAs do banco. Cacheado por (tenant, sync)
+    para que filtros e troca de abas fiquem rápidos mesmo com muitos registros."""
+    meta = db.get_meta(tenant_id)
+    sm, um = meta["status_map"], meta["user_map"]
+    deals = build_deals_df(db.deals_df(tenant_id), sm, um, cat_id)
+    leads = build_leads_df(db.leads_df(tenant_id), sm, um)
+    spa = {et: build_spa_df(db.spa_items_df(tenant_id, et), sm, um, et) for et in spa_ids}
+    return deals, leads, spa
+
+
 def render_dashboard(tenant: dict, user: dict):
     meta = db.get_meta(tenant["ID"])
     status_map, user_map = meta["status_map"], meta["user_map"]
     cat_id = tenant["SALES_CATEGORY_ID"]
     cat_name = meta["categories"].get(cat_id, f"Funil {cat_id}")
 
-    deals_all = build_deals_df(db.deals_df(tenant["ID"]), status_map, user_map, cat_id)
-    leads_all = build_leads_df(db.leads_df(tenant["ID"]), status_map, user_map)
-    meet_all = build_meetings_df(db.meetings_df(tenant["ID"]), status_map, user_map)
+    fmap = db.get_field_map(tenant["ID"])
+    spas = _spa_list(fmap)
 
     sync = db.get_sync(tenant["ID"])
+    cache_key = (sync or {}).get("LAST_RUN") or "none"
+    deals_all, leads_all, spa_all = load_frames(
+        tenant["ID"], cat_id, tuple(s["entity_type_id"] for s in spas), cache_key)
+    n_spa = sum(len(v) for v in spa_all.values())
     st.title(f"📊 {tenant['NAME']}")
     info = (f"Funil: **{cat_name}** · {len(deals_all)} negócios · {len(leads_all)} leads"
-            f" · {len(meet_all)} reuniões")
+            f" · {n_spa} itens SPA")
     if sync and sync.get("LAST_RUN"):
         info += f" · última sync: {sync['LAST_RUN'].replace('T', ' ')}"
     st.caption(info)
@@ -237,7 +253,7 @@ def render_dashboard(tenant: dict, user: dict):
 
     deals_f, leads_f = flt(deals_all), flt(leads_all)
     deals_t, leads_t = flt(deals_all, use_date=False), flt(leads_all, use_date=False)
-    meet_f = flt(meet_all)
+    spa_f = {et: flt(df) for et, df in spa_all.items()}
 
     won = deals_f[deals_f["Situação"] == "Ganho"]
     lost = deals_f[deals_f["Situação"] == "Perdido"]
@@ -264,9 +280,16 @@ def render_dashboard(tenant: dict, user: dict):
     r2[3].metric("⏱️ Ciclo (mediana)", f"{ciclo:.0f} dias" if ciclo else "—")
     st.divider()
 
-    tabs = st.tabs(["📈 Visão geral", "🛒 Pipeline", "📇 Leads", "🤝 Reuniões", "👤 Vendedores",
-                    "🌐 Fontes", "🎯 Metas", "📅 Mês a mês", "🗂️ Dados"])
-    stage_names = status_map.get(f"DEAL_STAGE_{cat_id}", {})
+    spa_labels = [f"{s.get('icon', '🧩')} {s['label']}" for s in spas]
+    tab_names = (["📈 Visão geral", "📊 Gestão", "🛒 Pipeline", "📇 Leads"] + spa_labels +
+                 ["👤 Vendedores", "🌐 Fontes", "🎯 Metas", "📅 Mês a mês", "🗂️ Dados"])
+    tabs = st.tabs(tab_names)
+    # índices das abas fixas após as SPAs dinâmicas (4 abas iniciais)
+    base = 4 + len(spas)
+    tab_vend, tab_font, tab_meta, tab_mom, tab_dados = (tabs[base], tabs[base + 1], tabs[base + 2],
+                                                        tabs[base + 3], tabs[base + 4])
+    # estágios do funil de vendas (cat 0 usa DEAL_STAGE; demais usam DEAL_STAGE_<cat>)
+    stage_names = status_map.get(f"DEAL_STAGE_{cat_id}") or status_map.get("DEAL_STAGE", {})
     order = list(stage_names.values())
 
     # -------- visão geral --------
@@ -310,8 +333,12 @@ def render_dashboard(tenant: dict, user: dict):
             g.columns = ["Estágio", "Qtde", "Probabilidade", "Valor aberto", "Valor ponderado", "ord"]
             st.dataframe(g.drop(columns="ord"), width='stretch', hide_index=True)
 
-    # -------- pipeline --------
+    # -------- gestão --------
     with tabs[1]:
+        render_gestao(deals_t, leads_t)
+
+    # -------- pipeline --------
+    with tabs[2]:
         c = st.columns(3)
         c[0].metric("Abertos", fmt_int(len(opend)), help=fmt_brl(valor_aberto))
         c[1].metric("Ganhos", fmt_int(len(won)), help=fmt_brl(valor_ganho))
@@ -345,7 +372,7 @@ def render_dashboard(tenant: dict, user: dict):
         dim_bar(cc2[1], deals_f, "SEGMENTO", "Negócios por segmento")
 
     # -------- leads --------
-    with tabs[2]:
+    with tabs[3]:
         c = st.columns(4)
         junk = int(leads_f["Desqualificado"].sum()) if total_leads else 0
         noshow = int((leads_f["Status"] == "No-show/Cancelada/Regendamento").sum()) if total_leads else 0
@@ -379,12 +406,13 @@ def render_dashboard(tenant: dict, user: dict):
         dim_bar(cc3[1], leads_f, "CARGO", "Leads por cargo")
         dim_bar(st, leads_f, "MOTIVO", "Motivos de desqualificação (leads)", LOST_COLOR)
 
-    # -------- reuniões --------
-    with tabs[3]:
-        render_meetings(meet_f, status_map)
+    # -------- SPAs dinâmicas (reuniões / processamento / pós-vendas / diárias...) --------
+    for i, s in enumerate(spas):
+        with tabs[4 + i]:
+            render_spa(spa_f.get(s["entity_type_id"], pd.DataFrame()), s["label"])
 
     # -------- vendedores --------
-    with tabs[4]:
+    with tab_vend:
         if deals_f.empty:
             st.info("Sem negócios no filtro atual.")
         else:
@@ -396,7 +424,7 @@ def render_dashboard(tenant: dict, user: dict):
                 "Pipeline aberto": g.loc[g["Situação"] == "Aberto", "OPPORTUNITY"].sum(),
             }), include_groups=False).reset_index()
             fech = agg["Ganhos"] + agg["Perdidos"]
-            agg["Win rate %"] = (agg["Ganhos"] / fech.replace(0, pd.NA) * 100).round(1)
+            agg["Win rate %"] = (agg["Ganhos"] / fech.replace(0, float("nan")) * 100).round(1)
             agg = agg.sort_values("Valor ganho", ascending=False)
             fig = px.bar(agg, x="Vendedor", y="Valor ganho", text_auto=".2s")
             fig.update_traces(marker_color=WON_COLOR)
@@ -409,7 +437,7 @@ def render_dashboard(tenant: dict, user: dict):
             st.dataframe(disp, width='stretch', hide_index=True)
 
     # -------- fontes --------
-    with tabs[5]:
+    with tab_font:
         cc = st.columns(2)
         if not deals_f.empty:
             sd = deals_f.copy()
@@ -428,69 +456,137 @@ def render_dashboard(tenant: dict, user: dict):
                 cc[1].plotly_chart(fig2, width='stretch')
 
     # -------- metas --------
-    with tabs[6]:
+    with tab_meta:
         render_metas(tenant, user, deals_t, user_map)
 
     # -------- mês a mês --------
-    with tabs[7]:
+    with tab_mom:
         render_mom(deals_t, leads_t)
 
     # -------- dados --------
-    with tabs[8]:
+    with tab_dados:
         st.download_button("⬇️ Deals (CSV)", deals_f.to_csv(index=False).encode("utf-8-sig"),
                            "deals.csv", "text/csv")
         st.dataframe(deals_f, width='stretch', hide_index=True)
         st.download_button("⬇️ Leads (CSV)", leads_f.to_csv(index=False).encode("utf-8-sig"),
                            "leads.csv", "text/csv")
         st.dataframe(leads_f, width='stretch', hide_index=True)
-        if not meet_f.empty:
-            st.download_button("⬇️ Reuniões (CSV)", meet_f.to_csv(index=False).encode("utf-8-sig"),
-                               "reunioes.csv", "text/csv")
-            st.dataframe(meet_f, width='stretch', hide_index=True)
+        for s in spas:
+            df = spa_f.get(s["entity_type_id"], pd.DataFrame())
+            if not df.empty:
+                st.download_button(f"⬇️ {s['label']} (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
+                                   f"spa_{s['entity_type_id']}.csv", "text/csv",
+                                   key=f"dl_spa_{s['entity_type_id']}")
+                st.dataframe(df, width='stretch', hide_index=True)
 
 
-def render_meetings(meet_f, status_map):
-    st.markdown("### Reuniões (SPA 1050)")
-    if meet_f.empty:
-        st.info("Sem reuniões no filtro atual.")
+def _period(series: pd.Series, gran: str) -> pd.Series:
+    """Converte datas em rótulo de período conforme a granularidade escolhida."""
+    if gran == "Dia":
+        return series.dt.date.astype(str)
+    code = {"Semana": "W", "Mês": "M", "Trimestre": "Q", "Ano": "Y"}[gran]
+    return series.dt.to_period(code).astype(str)
+
+
+def render_gestao(deals_t, leads_t):
+    st.markdown("### Indicadores de gestão")
+    st.caption("Visão de alto nível: geração de demanda e saúde do funil. "
+               "Respeita os filtros de vendedor/fonte/período da barra lateral.")
+    won = deals_t[deals_t["Situação"] == "Ganho"]
+    tot_leads = len(leads_t)
+    conv = int(leads_t["Convertido"].sum()) if tot_leads else 0
+    receita = won["OPPORTUNITY"].sum()
+    ticket = won["OPPORTUNITY"].mean() if len(won) else 0
+    k = st.columns(5)
+    k[0].metric("Leads gerados", fmt_int(tot_leads))
+    k[1].metric("Conversão de leads", f"{(conv/tot_leads*100) if tot_leads else 0:.1f}%")
+    k[2].metric("Negócios criados", fmt_int(len(deals_t)))
+    k[3].metric("Ganhos (novos clientes)", fmt_int(len(won)))
+    k[4].metric("Receita ganha", fmt_brl(receita))
+
+    st.markdown("#### Geração de demanda")
+    gran = st.radio("Granularidade", ["Dia", "Semana", "Mês", "Trimestre", "Ano"],
+                    index=2, horizontal=True, key="gran_gestao")
+    lead_s = leads_t.assign(p=_period(leads_t["DATE_CREATE"], gran)).groupby("p").size().rename("Leads")
+    deal_s = deals_t.assign(p=_period(deals_t["DATE_CREATE"], gran)).groupby("p").size().rename("Negócios")
+    won_s = won.assign(p=_period(won["DATE_CREATE"], gran)).groupby("p").size().rename("Ganhos")
+    dem = pd.concat([lead_s, deal_s, won_s], axis=1).fillna(0).reset_index().rename(columns={"p": "Período"})
+    dem = dem[dem["Período"] != "NaT"].sort_values("Período")
+    if not dem.empty:
+        m = dem.melt(id_vars="Período", var_name="Tipo", value_name="Qtde")
+        fig = px.bar(m, x="Período", y="Qtde", color="Tipo", barmode="group",
+                     color_discrete_map={"Leads": META_COLOR, "Negócios": OPEN_COLOR, "Ganhos": WON_COLOR})
+        fig.update_layout(title=f"Leads, negócios e ganhos por {gran.lower()}", height=420,
+                          margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig, width="stretch")
+
+    st.markdown("#### Geração de leads por origem e conversão para ganho")
+    lg = leads_t.groupby("Fonte").agg(Leads=("ID", "count"), Conv=("Convertido", "sum")).reset_index()
+    dg = (deals_t.assign(_g=(deals_t["Situação"] == "Ganho").astype(int))
+          .groupby("Fonte").agg(Negócios=("ID", "count"), Ganhos=("_g", "sum")).reset_index())
+    org = lg.merge(dg, on="Fonte", how="outer").fillna(0)
+    org["Conv. lead %"] = (org["Conv"] / org["Leads"].replace(0, float("nan")) * 100).round(1)
+    org["Win %"] = (org["Ganhos"] / org["Negócios"].replace(0, float("nan")) * 100).round(1)
+    org = org.sort_values("Leads", ascending=False)
+    if not org.empty and org["Leads"].sum() > 0:
+        fig2 = px.bar(org.sort_values("Leads").tail(15), x="Leads", y="Fonte",
+                      orientation="h", text_auto=True)
+        fig2.update_traces(marker_color=META_COLOR)
+        fig2.update_layout(title="Leads por origem", height=460, margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig2, width="stretch")
+    disp = org.drop(columns=["Conv"]).copy()
+    for c in ["Conv. lead %", "Win %"]:
+        disp[c] = disp[c].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
+    for c in ["Leads", "Negócios", "Ganhos"]:
+        disp[c] = disp[c].map(fmt_int)
+    st.dataframe(disp, width="stretch", hide_index=True)
+
+
+SPA_SIT_COLORS = {"Concluído": WON_COLOR, "Insucesso": LOST_COLOR,
+                  "Novo": OPEN_COLOR, "Em andamento": META_COLOR}
+
+
+def render_spa(df, label):
+    st.markdown(f"### {label}")
+    if df.empty:
+        st.info(f"Sem itens de '{label}' no filtro atual.")
         return
-    total = len(meet_f)
-    agend = int((meet_f["Situação"] == "Agendada").sum())
-    part = int((meet_f["Situação"] == "Participou").sum())
-    nosh = int((meet_f["Situação"] == "No-show").sum())
-    base = part + nosh
-    taxa_noshow = (nosh / base * 100) if base else 0
-    taxa_comp = (part / base * 100) if base else 0
+    total = len(df)
+    novo = int((df["Situação"] == "Novo").sum())
+    andamento = int((df["Situação"] == "Em andamento").sum())
+    ok = int((df["Situação"] == "Concluído").sum())
+    fail = int((df["Situação"] == "Insucesso").sum())
+    fechados = ok + fail
+    taxa_ok = (ok / fechados * 100) if fechados else 0
     k = st.columns(4)
-    k[0].metric("Total de reuniões", fmt_int(total))
-    k[1].metric("Agendadas (em aberto)", fmt_int(agend))
-    k[2].metric("Comparecimento", f"{taxa_comp:.1f}%", help=f"{part} participaram")
-    k[3].metric("No-show", f"{taxa_noshow:.1f}%", help=f"{nosh} faltas")
+    k[0].metric("Total", fmt_int(total))
+    k[1].metric("Em aberto", fmt_int(novo + andamento), help="Novos + em andamento")
+    k[2].metric("Concluídos", fmt_int(ok))
+    k[3].metric("Taxa de sucesso", f"{taxa_ok:.1f}%", help=f"{ok} de {fechados} finalizados")
 
     cc = st.columns(2)
-    by_sit = meet_f.groupby("Estágio").size().reset_index(name="Qtde").sort_values("Qtde")
-    fig = px.bar(by_sit, x="Qtde", y="Estágio", orientation="h", text_auto=True)
-    fig.update_layout(title="Reuniões por estágio", height=400, margin=dict(l=10, r=10, t=50, b=10))
+    by_st = df.groupby("Estágio").size().reset_index(name="Qtde").sort_values("Qtde")
+    fig = px.bar(by_st, x="Qtde", y="Estágio", orientation="h", text_auto=True)
+    fig.update_layout(title="Por estágio", height=420, margin=dict(l=10, r=10, t=50, b=10))
     cc[0].plotly_chart(fig, width="stretch")
 
-    by_mon = meet_f.groupby(["Mês criação", "Situação"]).size().reset_index(name="Qtde")
+    by_mon = df.groupby(["Mês criação", "Situação"]).size().reset_index(name="Qtde")
     by_mon = by_mon[by_mon["Mês criação"] != "NaT"]
     if not by_mon.empty:
         fig2 = px.bar(by_mon, x="Mês criação", y="Qtde", color="Situação", barmode="stack",
-                      color_discrete_map={"Participou": WON_COLOR, "No-show": LOST_COLOR,
-                                          "Agendada": OPEN_COLOR, "Outros": "#9ca3af"})
-        fig2.update_layout(title="Reuniões por mês", height=400, margin=dict(l=10, r=10, t=50, b=10))
+                      color_discrete_map=SPA_SIT_COLORS)
+        fig2.update_layout(title="Por mês (criação)", height=420, margin=dict(l=10, r=10, t=50, b=10))
         cc[1].plotly_chart(fig2, width="stretch")
 
     cc2 = st.columns(2)
-    dim_bar(cc2[0], meet_f, "Vendedor", "Reuniões por responsável")
-    dim_bar(cc2[1], meet_f, "Fonte", "Reuniões por fonte")
+    dim_bar(cc2[0], df, "Vendedor", "Por responsável")
+    dim_bar(cc2[1], df, "Fonte", "Por fonte")
 
 
 def render_metas(tenant, user, deals_t, user_map):
     st.markdown("### Metas por vendedor")
     can_edit = user["ROLE"] in ("master", "client")  # gestores podem editar
-    hoje = datetime(2026, 6, 17)  # data corrente do sistema
+    hoje = datetime.now()
     cols = st.columns(3)
     ano = cols[0].number_input("Ano", min_value=2020, max_value=2100, value=hoje.year, step=1)
     mes = cols[1].selectbox("Mês", list(range(1, 13)), index=hoje.month - 1,

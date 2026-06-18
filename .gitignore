@@ -13,3 +13,4 @@ zopu.db-shm
 
 _probe/
 .cache/
+*.zip

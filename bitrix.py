@@ -79,6 +79,38 @@ class BitrixClient:
             start = nxt
         return results
 
+    def call_list_by_id(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        id_field: str = "ID",
+        max_iter: int = 20000,
+    ) -> List[Dict[str, Any]]:
+        """Paginação por ID (filter >ID + start=-1), recomendada pelo Bitrix para
+        grandes volumes: rápida e sem o limite/lentidão da paginação por offset."""
+        params = dict(params or {})
+        base_filter = dict(params.get("filter") or {})
+        params["order"] = {id_field: "ASC"}
+        params["start"] = -1  # desativa a contagem total (mais rápido)
+        results: List[Dict[str, Any]] = []
+        last_id = 0
+        for _ in range(max_iter):
+            f = dict(base_filter)
+            f[f">{id_field}"] = last_id
+            params["filter"] = f
+            data = self.call(method, params)
+            batch = data.get("result", []) or []
+            if not batch:
+                break
+            results.extend(batch)
+            try:
+                last_id = int(batch[-1][id_field])
+            except (KeyError, ValueError, TypeError):
+                break
+            if len(batch) < 50:
+                break
+        return results
+
     # ---------- Dados principais ----------
 
     def get_deals(
@@ -97,10 +129,10 @@ class BitrixClient:
             flt["CATEGORY_ID"] = category_id
         if modified_since:
             flt[">=DATE_MODIFY"] = modified_since
-        params: Dict[str, Any] = {"select": select, "order": {"DATE_MODIFY": "ASC"}}
+        params: Dict[str, Any] = {"select": select}
         if flt:
             params["filter"] = flt
-        return self.call_list("crm.deal.list", params)
+        return self.call_list_by_id("crm.deal.list", params)
 
     def get_leads(
         self,
@@ -111,15 +143,15 @@ class BitrixClient:
             "ID", "TITLE", "STATUS_ID", "STATUS_SEMANTIC_ID", "OPPORTUNITY",
             "ASSIGNED_BY_ID", "DATE_CREATE", "DATE_MODIFY", "SOURCE_ID",
         ] + list(extra_select or [])
-        params: Dict[str, Any] = {"select": select, "order": {"DATE_MODIFY": "ASC"}}
+        params: Dict[str, Any] = {"select": select}
         if modified_since:
             params["filter"] = {">=DATE_MODIFY": modified_since}
-        return self.call_list("crm.lead.list", params)
+        return self.call_list_by_id("crm.lead.list", params)
 
-    def get_meetings(self, entity_type_id: int = 1050) -> List[Dict[str, Any]]:
-        """Itens de um SPA (Smart Process), ex.: reuniões. Resposta vem em
-        result.items (formato diferente das listas clássicas). Sempre carga
-        completa (volume pequeno)."""
+    def get_spa_items(self, entity_type_id: int) -> List[Dict[str, Any]]:
+        """Itens de um SPA (Smart Process): reuniões, processamento de pedido,
+        pós-vendas, diárias, etc. Resposta vem em result.items (formato diferente
+        das listas clássicas). Sempre carga completa."""
         results: List[Dict[str, Any]] = []
         start = 0
         for _ in range(200):

@@ -294,44 +294,16 @@ def render_dashboard(tenant: dict, user: dict):
 
     # -------- visão geral --------
     with tabs[0]:
-        c = st.columns(2)
-        funnel = deals_f.groupby("Estágio")["OPPORTUNITY"].agg(["count", "sum"]).reset_index()
-        funnel["ord"] = funnel["Estágio"].apply(lambda x: order.index(x) if x in order else 999)
-        funnel = funnel.sort_values("ord")
-        if not funnel.empty:
-            fig = go.Figure(go.Funnel(y=funnel["Estágio"], x=funnel["count"],
-                                      textinfo="value+percent initial",
-                                      marker={"color": PALETTE[: len(funnel)]}))
-            fig.update_layout(title="Funil de negócios (nº)", height=420,
-                              margin=dict(l=10, r=10, t=50, b=10))
-            c[0].plotly_chart(fig, width='stretch')
+        render_funnel(deals_f, stage_names)
+        st.markdown("#### Valor por situação")
         sit = (deals_f.groupby("Situação")["OPPORTUNITY"].sum()
                .reindex(["Aberto", "Ganho", "Perdido"]).fillna(0).reset_index())
-        fig2 = px.bar(sit, x="Situação", y="OPPORTUNITY", text_auto=".2s", color="Situação",
+        figs = px.bar(sit, x="OPPORTUNITY", y="Situação", orientation="h", text_auto=".2s",
+                      color="Situação",
                       color_discrete_map={"Ganho": WON_COLOR, "Perdido": LOST_COLOR, "Aberto": OPEN_COLOR})
-        fig2.update_layout(title="Valor por situação (R$)", height=420, showlegend=False,
-                           yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
-        c[1].plotly_chart(fig2, width='stretch')
-
-        st.markdown("#### Forecast ponderado (pipeline aberto)")
-        open_only = [s for s in order if s not in ("Negócios ganho", "Negócio perdido")]
-        n = len(open_only)
-        prob = {s: round((i + 1) / (n + 1), 2) for i, s in enumerate(open_only)} if n else {}
-        fc = opend.copy()
-        fc["Prob"] = fc["Estágio"].map(prob).fillna(0.3)
-        fc["Ponderado"] = fc["OPPORTUNITY"] * fc["Prob"]
-        st.metric("Previsão ponderada de fechamento", fmt_brl(fc["Ponderado"].sum()),
-                  help="Σ (valor × probabilidade do estágio) dos negócios abertos.")
-        if not fc.empty:
-            g = (fc.groupby("Estágio").agg(Qtde=("ID", "count"), Prob=("Prob", "first"),
-                 Aberto=("OPPORTUNITY", "sum"), Ponderado=("Ponderado", "sum")).reset_index())
-            g["ord"] = g["Estágio"].apply(lambda x: order.index(x) if x in order else 999)
-            g = g.sort_values("ord")
-            g["Prob"] = (g["Prob"] * 100).map(lambda x: f"{x:.0f}%")
-            g["Aberto"] = g["Aberto"].map(fmt_brl)
-            g["Ponderado"] = g["Ponderado"].map(fmt_brl)
-            g.columns = ["Estágio", "Qtde", "Probabilidade", "Valor aberto", "Valor ponderado", "ord"]
-            st.dataframe(g.drop(columns="ord"), width='stretch', hide_index=True)
+        figs.update_layout(height=300, showlegend=False, xaxis_title="R$",
+                           margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(figs, width="stretch")
 
     # -------- gestão --------
     with tabs[1]:
@@ -478,6 +450,80 @@ def render_dashboard(tenant: dict, user: dict):
                                    f"spa_{s['entity_type_id']}.csv", "text/csv",
                                    key=f"dl_spa_{s['entity_type_id']}")
                 st.dataframe(df, width='stretch', hide_index=True)
+
+
+def render_funnel(deals_f, stage_names):
+    """Funil de conversão (esteira) em barras horizontais:
+    - nº de negócios que PASSARAM por cada fase (cumulativo: quem está numa fase
+      posterior ou ganhou também passou pelas anteriores);
+    - valor (R$) em aberto por fase;
+    - valor ponderado pela taxa de conversão histórica até o ganho (previsibilidade).
+    """
+    if deals_f.empty or not stage_names:
+        st.caption("Sem negócios para o funil.")
+        return
+
+    def cls(sid):
+        s = str(sid)
+        if s.endswith(":WON") or s == "WON":
+            return "Ganho"
+        if s.endswith(":LOSE") or s == "LOSE":
+            return "Perdido"
+        return "Aberto"
+
+    items = list(stage_names.items())  # (stage_id, nome) na ordem do funil
+    open_names = [name for sid, name in items if cls(sid) == "Aberto"]
+    won_name = next((name for sid, name in items if cls(sid) == "Ganho"), "Ganho")
+    fo = open_names + [won_name]  # fases do funil, em ordem
+    cur_cnt = deals_f.groupby("Estágio").size()
+    cur_val = deals_f.groupby("Estágio")["OPPORTUNITY"].sum()
+    nrm = len(fo)
+    # quem passou pela fase i = quem está na fase i ou em qualquer fase posterior (+ ganhos)
+    reached_cnt = [int(sum(cur_cnt.get(nm, 0) for nm in fo[i:])) for i in range(nrm)]
+    reached_val = [float(sum(cur_val.get(nm, 0) for nm in fo[i:])) for i in range(nrm)]
+    base = reached_cnt[0] if reached_cnt and reached_cnt[0] else 0
+    won_reached = reached_cnt[-1] if reached_cnt else 0
+
+    rows, prev_total = [], 0.0
+    for i, nm in enumerate(fo):
+        pwin = (won_reached / reached_cnt[i]) if reached_cnt[i] else 0.0
+        aberto = float(cur_val.get(nm, 0.0)) if nm in open_names else 0.0
+        previsto = aberto * pwin
+        prev_total += previsto
+        rows.append({"Fase": nm, "Alcançaram": reached_cnt[i], "Valor alcançado": reached_val[i],
+                     "Conv. vs 1ª": (reached_cnt[i] / base * 100) if base else 0,
+                     "Prob. ganho": pwin * 100, "Valor em aberto": aberto, "Previsão": previsto})
+    fdf = pd.DataFrame(rows)
+    order_rev = fo[::-1]  # plotly desenha de baixo p/ cima: 1ª fase no topo
+
+    c = st.columns(2)
+    fdf["rot"] = fdf.apply(lambda r: f"{int(r['Alcançaram'])} ({r['Conv. vs 1ª']:.0f}%)", axis=1)
+    figA = px.bar(fdf, x="Alcançaram", y="Fase", orientation="h", text="rot",
+                  category_orders={"Fase": order_rev})
+    figA.update_traces(marker_color=OPEN_COLOR, textposition="outside", cliponaxis=False)
+    figA.update_layout(title="Funil — negócios que passaram por cada fase", height=440,
+                       margin=dict(l=10, r=10, t=50, b=10))
+    c[0].plotly_chart(figA, width="stretch")
+
+    val_m = fdf.melt(id_vars="Fase", value_vars=["Valor em aberto", "Previsão"],
+                     var_name="Tipo", value_name="R$")
+    figB = px.bar(val_m, x="R$", y="Fase", orientation="h", color="Tipo", barmode="group",
+                  text_auto=".2s", category_orders={"Fase": order_rev},
+                  color_discrete_map={"Valor em aberto": OPEN_COLOR, "Previsão": WON_COLOR})
+    figB.update_layout(title="Valor por fase e previsão (ponderada pela conversão)", height=440,
+                       margin=dict(l=10, r=10, t=50, b=10), xaxis_title="R$")
+    c[1].plotly_chart(figB, width="stretch")
+
+    st.metric("🔮 Previsão ponderada do pipeline aberto", fmt_brl(prev_total),
+              help="Σ (valor em aberto na fase × probabilidade histórica de ganho a partir da fase).")
+
+    show = fdf[["Fase", "Alcançaram", "Conv. vs 1ª", "Prob. ganho", "Valor alcançado",
+                "Valor em aberto", "Previsão"]].copy()
+    show["Conv. vs 1ª"] = show["Conv. vs 1ª"].map(lambda x: f"{x:.0f}%")
+    show["Prob. ganho"] = show["Prob. ganho"].map(lambda x: f"{x:.0f}%")
+    for col in ["Valor alcançado", "Valor em aberto", "Previsão"]:
+        show[col] = show[col].map(fmt_brl)
+    st.dataframe(show, width="stretch", hide_index=True)
 
 
 def _period(series: pd.Series, gran: str) -> pd.Series:

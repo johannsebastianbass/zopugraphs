@@ -93,7 +93,7 @@ def main() -> int:
         r = sync_tenant(tenant, full=True)
         if r.get("ok"):
             print(f"[+] OK: {r['deals_total']} deals, {r['leads_total']} leads, "
-                  f"{r['meetings_total']} reunioes.")
+                  f"{r['spa_total']} itens SPA.")
         else:
             print(f"[!] Erro na sincronizacao: {r.get('error')}")
             return 1

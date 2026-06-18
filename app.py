@@ -567,10 +567,13 @@ def render_funnel(deals_f, stage_names):
     order_rev = fo[::-1]  # plotly desenha de baixo p/ cima: 1ª fase no topo
 
     c = st.columns(2)
-    fdf["rot"] = fdf.apply(lambda r: f"{int(r['Alcançaram'])} ({r['Conv. vs 1ª']:.0f}%)", axis=1)
-    figA = px.bar(fdf, x="Alcançaram", y="Fase", orientation="h", text="rot",
-                  category_orders={"Fase": order_rev})
-    figA.update_traces(marker_color=OPEN_COLOR, textposition="outside", cliponaxis=False)
+    # funil de verdade, ordenado do maior (fase inicial) ao menor (fase final)
+    fsorted = fdf.sort_values("Alcançaram", ascending=False)
+    colors = [PALETTE[i % len(PALETTE)] for i in range(len(fsorted))]
+    figA = go.Figure(go.Funnel(
+        y=fsorted["Fase"], x=fsorted["Alcançaram"],
+        textposition="inside", textinfo="value+percent initial",
+        marker={"color": colors}))
     figA.update_layout(title="Funil — negócios que passaram por cada fase", height=440,
                        margin=dict(l=10, r=10, t=50, b=10))
     c[0].plotly_chart(figA, width="stretch")

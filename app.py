@@ -182,16 +182,31 @@ def maybe_autosync(tenant: dict):
 
 
 # ====================================================================== dashboard
+def build_products_df(prod, deals) -> pd.DataFrame:
+    """Junta as linhas de produto com os dados do negócio (situação, vendedor,
+    fonte, data) para permitir filtros e análise de produtos ganhos."""
+    if prod.empty:
+        return prod
+    prod = prod.copy()
+    prod["TOTAL"] = pd.to_numeric(prod["TOTAL"], errors="coerce").fillna(0.0)
+    prod["QUANTITY"] = pd.to_numeric(prod["QUANTITY"], errors="coerce").fillna(0.0)
+    cols = ["ID", "Situação", "Vendedor", "Fonte", "DATE_CREATE"]
+    info = deals[cols].rename(columns={"ID": "DEAL_ID"}) if not deals.empty else \
+        pd.DataFrame(columns=["DEAL_ID", "Situação", "Vendedor", "Fonte", "DATE_CREATE"])
+    return prod.merge(info, on="DEAL_ID", how="left")
+
+
 @st.cache_data(ttl=600, show_spinner="Carregando dados…")
 def load_frames(tenant_id: int, cat_id: str, spa_ids: tuple, cache_key: str):
-    """Carrega e processa deals/leads/SPAs do banco. Cacheado por (tenant, sync)
-    para que filtros e troca de abas fiquem rápidos mesmo com muitos registros."""
+    """Carrega e processa deals/leads/SPAs/produtos do banco. Cacheado por
+    (tenant, sync) para que filtros e troca de abas fiquem rápidos."""
     meta = db.get_meta(tenant_id)
     sm, um = meta["status_map"], meta["user_map"]
     deals = build_deals_df(db.deals_df(tenant_id), sm, um, cat_id)
     leads = build_leads_df(db.leads_df(tenant_id), sm, um)
     spa = {et: build_spa_df(db.spa_items_df(tenant_id, et), sm, um, et) for et in spa_ids}
-    return deals, leads, spa
+    products = build_products_df(db.products_df(tenant_id), deals)
+    return deals, leads, spa, products
 
 
 def render_dashboard(tenant: dict, user: dict):
@@ -205,7 +220,7 @@ def render_dashboard(tenant: dict, user: dict):
 
     sync = db.get_sync(tenant["ID"])
     cache_key = (sync or {}).get("LAST_RUN") or "none"
-    deals_all, leads_all, spa_all = load_frames(
+    deals_all, leads_all, spa_all, prod_all = load_frames(
         tenant["ID"], cat_id, tuple(s["entity_type_id"] for s in spas), cache_key)
     n_spa = sum(len(v) for v in spa_all.values())
     st.title(f"📊 {tenant['NAME']}")
@@ -254,6 +269,7 @@ def render_dashboard(tenant: dict, user: dict):
     deals_f, leads_f = flt(deals_all), flt(leads_all)
     deals_t, leads_t = flt(deals_all, use_date=False), flt(leads_all, use_date=False)
     spa_f = {et: flt(df) for et, df in spa_all.items()}
+    prod_f = flt(prod_all)
 
     won = deals_f[deals_f["Situação"] == "Ganho"]
     lost = deals_f[deals_f["Situação"] == "Perdido"]
@@ -281,11 +297,11 @@ def render_dashboard(tenant: dict, user: dict):
     st.divider()
 
     spa_labels = [f"{s.get('icon', '🧩')} {s['label']}" for s in spas]
-    tab_names = (["📈 Visão geral", "📊 Gestão", "🛒 Pipeline", "📇 Leads"] + spa_labels +
+    tab_names = (["📈 Visão geral", "📊 Gestão", "🛒 Pipeline", "📇 Leads", "🛍️ Produtos"] + spa_labels +
                  ["👤 Vendedores", "🌐 Fontes", "🎯 Metas", "📅 Mês a mês", "🗂️ Dados"])
     tabs = st.tabs(tab_names)
-    # índices das abas fixas após as SPAs dinâmicas (4 abas iniciais)
-    base = 4 + len(spas)
+    # índices das abas fixas após as SPAs dinâmicas (5 abas iniciais)
+    base = 5 + len(spas)
     tab_vend, tab_font, tab_meta, tab_mom, tab_dados = (tabs[base], tabs[base + 1], tabs[base + 2],
                                                         tabs[base + 3], tabs[base + 4])
     # estágios do funil de vendas (cat 0 usa DEAL_STAGE; demais usam DEAL_STAGE_<cat>)
@@ -378,9 +394,13 @@ def render_dashboard(tenant: dict, user: dict):
         dim_bar(cc3[1], leads_f, "CARGO", "Leads por cargo")
         dim_bar(st, leads_f, "MOTIVO", "Motivos de desqualificação (leads)", LOST_COLOR)
 
+    # -------- produtos --------
+    with tabs[4]:
+        render_produtos(prod_f)
+
     # -------- SPAs dinâmicas (reuniões / processamento / pós-vendas / diárias...) --------
     for i, s in enumerate(spas):
-        with tabs[4 + i]:
+        with tabs[5 + i]:
             render_spa(spa_f.get(s["entity_type_id"], pd.DataFrame()), s["label"])
 
     # -------- vendedores --------
@@ -450,6 +470,49 @@ def render_dashboard(tenant: dict, user: dict):
                                    f"spa_{s['entity_type_id']}.csv", "text/csv",
                                    key=f"dl_spa_{s['entity_type_id']}")
                 st.dataframe(df, width='stretch', hide_index=True)
+        if not prod_f.empty:
+            st.download_button("⬇️ Produtos (CSV)", prod_f.to_csv(index=False).encode("utf-8-sig"),
+                               "produtos.csv", "text/csv", key="dl_prod")
+            st.dataframe(prod_f, width='stretch', hide_index=True)
+
+
+def render_produtos(prod_f):
+    st.markdown("### Análise de produtos")
+    if prod_f.empty:
+        st.info("Nenhuma linha de produto lançada nos negócios deste período. "
+                "Quando os negócios tiverem produtos no Bitrix (crm.deal.productrows), "
+                "os indicadores aparecem aqui automaticamente.")
+        return
+    won = prod_f[prod_f["Situação"] == "Ganho"]
+    k = st.columns(4)
+    k[0].metric("Negócios com produto", fmt_int(prod_f["DEAL_ID"].nunique()))
+    k[1].metric("Produtos distintos", fmt_int(prod_f["PRODUCT_NAME"].nunique()))
+    k[2].metric("Receita em produtos (ganhos)", fmt_brl(won["TOTAL"].sum()))
+    k[3].metric("Qtd vendida (ganhos)", fmt_int(won["QUANTITY"].sum()))
+
+    base = won if not won.empty else prod_f
+    rotulo = "ganhos" if not won.empty else "todos os negócios"
+    g = (base.groupby("PRODUCT_NAME").agg(Receita=("TOTAL", "sum"), Qtd=("QUANTITY", "sum"),
+         Negócios=("DEAL_ID", "nunique")).reset_index())
+    cc = st.columns(2)
+    top_r = g.sort_values("Receita").tail(15)
+    fig = px.bar(top_r, x="Receita", y="PRODUCT_NAME", orientation="h", text_auto=".2s")
+    fig.update_traces(marker_color=WON_COLOR)
+    fig.update_layout(title=f"Top produtos por receita ({rotulo})", height=460,
+                      margin=dict(l=10, r=10, t=50, b=10), yaxis_title="")
+    cc[0].plotly_chart(fig, width="stretch")
+    top_q = g.sort_values("Qtd").tail(15)
+    fig2 = px.bar(top_q, x="Qtd", y="PRODUCT_NAME", orientation="h", text_auto=True)
+    fig2.update_traces(marker_color=OPEN_COLOR)
+    fig2.update_layout(title=f"Top produtos por quantidade ({rotulo})", height=460,
+                       margin=dict(l=10, r=10, t=50, b=10), yaxis_title="")
+    cc[1].plotly_chart(fig2, width="stretch")
+
+    disp = g.sort_values("Receita", ascending=False).copy()
+    disp["Receita"] = disp["Receita"].map(fmt_brl)
+    disp["Qtd"] = disp["Qtd"].map(lambda x: f"{x:.0f}")
+    disp.columns = ["Produto", "Receita", "Qtd", "Negócios"]
+    st.dataframe(disp, width="stretch", hide_index=True)
 
 
 def render_funnel(deals_f, stage_names):

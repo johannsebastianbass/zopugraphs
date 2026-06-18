@@ -57,6 +57,30 @@ def _cutoff_iso(hours: float) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
+def _product_rows(raw):
+    """Normaliza linhas de produto do Bitrix para o formato do banco."""
+    out = []
+    for r in raw:
+        price = float(r.get("PRICE") or 0)
+        qty = float(r.get("QUANTITY") or 0)
+        out.append({
+            "ID": str(r.get("ID")), "DEAL_ID": str(r.get("OWNER_ID")),
+            "PRODUCT_ID": str(r.get("PRODUCT_ID")), "PRODUCT_NAME": r.get("PRODUCT_NAME"),
+            "PRICE": price, "QUANTITY": qty, "TOTAL": price * qty,
+        })
+    return out
+
+
+def sync_products(tenant: dict) -> int:
+    """Busca/atualiza as linhas de produto de todos os negócios já no banco."""
+    tid = tenant["ID"]
+    client = BitrixClient(tenant["WEBHOOK"])
+    ids = db.deal_ids(tid)
+    rows = _product_rows(client.get_deal_productrows(ids)) if ids else []
+    db.replace_products(tid, ids, rows)
+    return len(rows)
+
+
 def _resolve(value, enum_map):
     """Converte ID(s) de enumeração em rótulo(s). Mantém texto livre como está."""
     if value in (None, "", 0, "0", [], "[]"):
@@ -119,6 +143,14 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
 
     nd = db.upsert_deals(tid, deals)
     nl = db.upsert_leads(tid, leads)
+    # linhas de produto dos negócios que vieram nesta sincronização
+    deal_ids_synced = [str(d.get("ID")) for d in deals]
+    try:
+        prod_rows = _product_rows(client.get_deal_productrows(deal_ids_synced)) if deal_ids_synced else []
+        db.replace_products(tid, deal_ids_synced, prod_rows)
+        npr = len(prod_rows)
+    except BitrixError:
+        npr = 0
     ns = 0
     for et, items in spa_raw.items():
         rows = [{
@@ -135,10 +167,10 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     else:
         mode = "completa" if modified_since is None else f"incremental({window_hours}h)"
     db.set_sync(tid, total["deals"], total["leads"],
-                note=f"{mode}: +{nd} deals, +{nl} leads, {ns} itens SPA")
+                note=f"{mode}: +{nd} deals, +{nl} leads, {ns} itens SPA, {npr} produtos")
     return {
         "tenant": tenant["NAME"], "ok": True, "mode": mode,
-        "deals_upsert": nd, "leads_upsert": nl, "spa_upsert": ns,
+        "deals_upsert": nd, "leads_upsert": nl, "spa_upsert": ns, "products_upsert": npr,
         "deals_total": total["deals"], "leads_total": total["leads"],
         "spa_total": total["spa"],
     }

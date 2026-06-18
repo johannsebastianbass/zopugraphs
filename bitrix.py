@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -175,6 +176,21 @@ class BitrixClient:
                 break
             start = nxt
         return results
+
+    def get_deal_productrows(self, deal_ids: List[str]) -> List[Dict[str, Any]]:
+        """Linhas de produto de vários negócios usando `batch` (até 50 por chamada).
+        Cada linha vem com OWNER_ID = ID do negócio."""
+        rows: List[Dict[str, Any]] = []
+        ids = [str(x) for x in deal_ids]
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            cmd = {f"d{j}": "crm.deal.productrows.get?" + urlencode({"id": x})
+                   for j, x in enumerate(chunk)}
+            res = self.call("batch", {"halt": 0, "cmd": cmd}).get("result", {}).get("result", {})
+            for j in range(len(chunk)):
+                for r in (res.get(f"d{j}") or []):
+                    rows.append(r)
+        return rows
 
     # ---------- Metadados de campos personalizados ----------
 

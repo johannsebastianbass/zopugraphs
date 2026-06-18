@@ -42,6 +42,8 @@ SPA_COLS = [
     "ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "ASSIGNED_BY_ID", "SOURCE_ID",
     "CREATED_TIME", "BEGINDATE", "OPPORTUNITY",
 ]
+# Linhas de produto dos negócios (crm.deal.productrows)
+PRODUCT_COLS = ["ID", "DEAL_ID", "PRODUCT_ID", "PRODUCT_NAME", "PRICE", "QUANTITY", "TOTAL"]
 
 
 def get_conn() -> sqlite3.Connection:
@@ -115,6 +117,15 @@ def init_db() -> None:
                 CREATED_TIME TEXT, BEGINDATE TEXT, OPPORTUNITY REAL,
                 PRIMARY KEY (TENANT_ID, ENTITY_TYPE_ID, ID)
             );
+
+            CREATE TABLE IF NOT EXISTS products (
+                TENANT_ID INTEGER NOT NULL,
+                ID TEXT NOT NULL,
+                DEAL_ID TEXT, PRODUCT_ID TEXT, PRODUCT_NAME TEXT,
+                PRICE REAL, QUANTITY REAL, TOTAL REAL,
+                PRIMARY KEY (TENANT_ID, ID)
+            );
+            CREATE INDEX IF NOT EXISTS idx_products_deal ON products (TENANT_ID, DEAL_ID);
 
             CREATE TABLE IF NOT EXISTS tenant_meta (
                 TENANT_ID INTEGER PRIMARY KEY,
@@ -334,6 +345,35 @@ def spa_items_df(tenant_id: int, entity_type_id: int) -> pd.DataFrame:
         return pd.read_sql_query(
             f"SELECT {','.join(SPA_COLS)} FROM spa_items WHERE TENANT_ID=? AND ENTITY_TYPE_ID=?",
             c, params=(tenant_id, entity_type_id),
+        )
+
+
+def deal_ids(tenant_id: int) -> List[str]:
+    with get_conn() as c:
+        return [r[0] for r in c.execute("SELECT ID FROM deals WHERE TENANT_ID=?", (tenant_id,))]
+
+
+def replace_products(tenant_id: int, deal_ids_list: List[str], rows: List[dict]) -> int:
+    """Substitui as linhas de produto dos negócios informados (apaga as antigas
+    desses negócios e insere as novas), mantendo consistência por negócio."""
+    with get_conn() as c:
+        if deal_ids_list:
+            c.executemany("DELETE FROM products WHERE TENANT_ID=? AND DEAL_ID=?",
+                          [(tenant_id, str(d)) for d in deal_ids_list])
+        if rows:
+            cols = PRODUCT_COLS
+            ph = ",".join(["?"] * (len(cols) + 1))
+            c.executemany(
+                f"INSERT OR REPLACE INTO products (TENANT_ID,{','.join(cols)}) VALUES ({ph})",
+                [[tenant_id] + [r.get(col) for col in cols] for r in rows],
+            )
+    return len(rows)
+
+
+def products_df(tenant_id: int) -> pd.DataFrame:
+    with get_conn() as c:
+        return pd.read_sql_query(
+            f"SELECT {','.join(PRODUCT_COLS)} FROM products WHERE TENANT_ID=?", c, params=(tenant_id,)
         )
 
 

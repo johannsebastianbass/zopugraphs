@@ -25,7 +25,7 @@ DB_PATH = os.environ.get("ZOPU_DB", str(Path(__file__).parent / "zopu.db"))
 DEAL_COLS = [
     "ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "OPPORTUNITY", "CURRENCY_ID",
     "ASSIGNED_BY_ID", "SOURCE_ID", "DATE_CREATE", "DATE_MODIFY", "CLOSEDATE", "CLOSED",
-    "SEGMENTO", "MOTIVO",
+    "SEGMENTO", "MOTIVO", "EXTRA",
 ]
 LEAD_COLS = [
     "ID", "TITLE", "STATUS_ID", "STATUS_SEMANTIC_ID", "OPPORTUNITY",
@@ -150,6 +150,7 @@ def init_db() -> None:
         # migrações idempotentes para bancos já existentes
         _ensure_col(c, "deals", "SEGMENTO", "TEXT")
         _ensure_col(c, "deals", "MOTIVO", "TEXT")
+        _ensure_col(c, "deals", "EXTRA", "TEXT")
         _ensure_col(c, "leads", "SEGMENTO", "TEXT")
         _ensure_col(c, "leads", "CARGO", "TEXT")
         _ensure_col(c, "leads", "MOTIVO", "TEXT")

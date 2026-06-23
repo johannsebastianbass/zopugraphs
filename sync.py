@@ -16,6 +16,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -71,6 +72,70 @@ def _product_rows(raw):
     return out
 
 
+def _truthy(v) -> bool:
+    return str(v).strip().lower() in ("1", "y", "true", "sim", "yes")
+
+
+def enrich_deals(deals, fmap, deal_enums, stage_name_map, camp_map):
+    """Resolve dimensões extras por negócio e grava em d['EXTRA'] (JSON),
+    além de SEGMENTO (via Objetivo) e Status do Cartão (Lead vs Negócio).
+    Genérico: tudo é dirigido pelo FIELD_MAP do tenant."""
+    dims = fmap.get("deal_dims", [])
+    seg_obj = fmap.get("segmento_objetivo")
+    card = fmap.get("card_status")
+    for d in deals:
+        extra = {}
+        for dim in dims:
+            raw = d.get(dim["field"])
+            t = dim.get("type", "string")
+            if raw in (None, "", [], "0", 0):
+                val = None
+            elif t == "enum":
+                val = _resolve(raw, deal_enums.get(dim["field"]))
+            elif t == "bool":
+                val = "Sim" if _truthy(raw) else "Não"
+            elif t == "stage":
+                val = stage_name_map.get(raw, raw)
+            elif t == "campaign_spa":
+                val = camp_map.get(str(raw), raw)
+            elif t == "number":
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    val = None
+            else:
+                val = raw
+            extra[dim["key"]] = val
+        # segmento via Objetivo Inicial (Grupo A/B)
+        if seg_obj:
+            obj = str(d.get(seg_obj) or "").lower()
+            if "consumo próprio" in obj or "consumo proprio" in obj or "corporativo" in obj:
+                d["SEGMENTO"] = "Grupo A"
+            elif "revenda" in obj or "distribuidor" in obj:
+                d["SEGMENTO"] = "Grupo B"
+            else:
+                d["SEGMENTO"] = None
+        # Status do Cartão (CRM com lead e negócio misturados nas fases)
+        if card:
+            stage = stage_name_map.get(d.get("STAGE_ID"), d.get("STAGE_ID"))
+            qual = _truthy(d.get(card["qual_field"]))
+            fant = extra.get(card.get("fase_anterior_key", "Fase Anterior"))
+            won, lost, qual_st = card["won"], card["lost"], card["qualified"]
+            if stage in won:
+                cs = "Negócio Ganho"
+            elif stage in lost and qual:
+                cs = "Negócio (Lead Qualificado)"
+            elif stage in lost:
+                cs = "Lead Desqualificado"
+            elif stage in qual_st or fant in qual_st:
+                cs = "Negócio (Lead Qualificado)"
+            else:
+                cs = "Lead"
+            extra["Status do Cartão"] = cs
+        d["EXTRA"] = json.dumps(extra, ensure_ascii=False)
+    return deals
+
+
 def sync_products(tenant: dict) -> int:
     """Busca/atualiza as linhas de produto de todos os negócios já no banco."""
     tid = tenant["ID"]
@@ -99,6 +164,17 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     lmap = fmap.get("lead", {})
     dmap = fmap.get("deal", {})
 
+    deal_dims = fmap.get("deal_dims", [])
+    card = fmap.get("card_status")
+    seg_obj = fmap.get("segmento_objetivo")
+    # códigos UF extras a selecionar nos negócios
+    extra_deal_codes = list(dmap.values()) + [d["field"] for d in deal_dims]
+    if seg_obj:
+        extra_deal_codes.append(seg_obj)
+    if card:
+        extra_deal_codes.append(card["qual_field"])
+    extra_deal_codes = list(dict.fromkeys(c for c in extra_deal_codes if c))
+
     # metadados (pequenos) — sempre atualiza para refletir novos estágios/usuários
     try:
         status_map = client.get_status_map()
@@ -109,9 +185,23 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
         lead_fields = client.get_fields("lead")
         deal_fields = client.get_fields("deal")
         lead_enums = client.enum_maps(lead_fields, [v for v in lmap.values()])
-        deal_enums = client.enum_maps(deal_fields, [v for v in dmap.values()])
+        enum_codes = [v for v in dmap.values()] + [d["field"] for d in deal_dims if d.get("type") == "enum"]
+        deal_enums = client.enum_maps(deal_fields, enum_codes)
     except BitrixError as e:
         return {"tenant": tenant["NAME"], "ok": False, "error": str(e)}
+
+    # mapa de estágios (para Fase Anterior e Status do Cartão) e de campanhas (SPA)
+    stage_name_map = (status_map.get(f"DEAL_STAGE_{tenant['SALES_CATEGORY_ID']}")
+                      or status_map.get("DEAL_STAGE", {}))
+    camp_map = {}
+    camp_dim = next((d for d in deal_dims if d.get("type") == "campaign_spa"), None)
+    if camp_dim:
+        try:
+            items = client.get_spa_items(camp_dim["spa_entity"])
+            cf = camp_dim["spa_code_field"]
+            camp_map = {str(it.get(cf)): it.get("title") for it in items if it.get(cf)}
+        except BitrixError:
+            camp_map = {}
 
     have = db.count_records(tid)
     first_load = (have["deals"] == 0 and have["leads"] == 0)
@@ -125,7 +215,7 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     try:
         deals = client.get_deals(category_id=tenant["SALES_CATEGORY_ID"],
                                  modified_since=modified_since, created_since=created_since,
-                                 extra_select=list(dmap.values()))
+                                 extra_select=extra_deal_codes)
         leads = client.get_leads(modified_since=modified_since, created_since=created_since,
                                  extra_select=list(lmap.values()))
         spa_raw = {s["entity_type_id"]: client.get_spa_items(s["entity_type_id"], created_since=created_since)
@@ -136,6 +226,9 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     for d in deals:
         d["SEGMENTO"] = _resolve(d.get(dmap.get("segmento")), deal_enums.get(dmap.get("segmento")))
         d["MOTIVO"] = _resolve(d.get(dmap.get("motivo")), deal_enums.get(dmap.get("motivo")))
+    # dimensões extras + segmento por objetivo + Status do Cartão (dirigido pelo FIELD_MAP)
+    if deal_dims or card or seg_obj:
+        enrich_deals(deals, fmap, deal_enums, stage_name_map, camp_map)
     for l in leads:
         l["SEGMENTO"] = _resolve(l.get(lmap.get("segmento")), lead_enums.get(lmap.get("segmento")))
         l["CARGO"] = _resolve(l.get(lmap.get("cargo")), lead_enums.get(lmap.get("cargo")))
@@ -145,12 +238,15 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     nl = db.upsert_leads(tid, leads)
     # linhas de produto dos negócios que vieram nesta sincronização
     deal_ids_synced = [str(d.get("ID")) for d in deals]
-    try:
-        prod_rows = _product_rows(client.get_deal_productrows(deal_ids_synced)) if deal_ids_synced else []
-        db.replace_products(tid, deal_ids_synced, prod_rows)
-        npr = len(prod_rows)
-    except BitrixError:
-        npr = 0
+    if fmap.get("skip_deal_products"):
+        npr = 0  # tenant usa produtos de orçamento (quote), não do negócio
+    else:
+        try:
+            prod_rows = _product_rows(client.get_deal_productrows(deal_ids_synced)) if deal_ids_synced else []
+            db.replace_products(tid, deal_ids_synced, prod_rows)
+            npr = len(prod_rows)
+        except BitrixError:
+            npr = 0
     ns = 0
     for et, items in spa_raw.items():
         rows = [{

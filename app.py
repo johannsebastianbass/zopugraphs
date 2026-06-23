@@ -81,6 +81,14 @@ def build_deals_df(df, status_map, user_map, category_id) -> pd.DataFrame:
     df["Ciclo (dias)"] = (df["CLOSEDATE"] - df["DATE_CREATE"]).dt.days
     df["Mês criação"] = df["DATE_CREATE"].dt.to_period("M").astype(str)
     df["Mês fechamento"] = df["CLOSEDATE"].dt.to_period("M").astype(str)
+    # dimensões extras (JSON em EXTRA) viram colunas: Canal, Campanha, Status do Cartão...
+    if "EXTRA" in df.columns:
+        parsed = df["EXTRA"].apply(lambda s: json.loads(s) if isinstance(s, str) and s else {})
+        keys = set()
+        for d in parsed:
+            keys.update(d.keys())
+        for k in keys:
+            df[k] = parsed.apply(lambda d: d.get(k))
     return df
 
 
@@ -365,6 +373,7 @@ def render_dashboard(tenant: dict, user: dict):
         cc2 = st.columns(2)
         dim_bar(cc2[0], lost, "MOTIVO", "Motivo de fechamento (perdidos)", LOST_COLOR)
         dim_bar(cc2[1], deals_f, "SEGMENTO", "Negócios por segmento")
+        render_extra_dims(deals_f)
 
     # -------- leads --------
     with tabs[3]:
@@ -481,6 +490,33 @@ def render_dashboard(tenant: dict, user: dict):
             st.download_button("⬇️ Produtos (CSV)", prod_f.to_csv(index=False).encode("utf-8-sig"),
                                "produtos.csv", "text/csv", key="dl_prod")
             st.dataframe(prod_f, width='stretch', hide_index=True)
+
+
+EXTRA_CAT_DIMS = ["Status do Cartão", "Canal", "Fonte/Origem", "Campanha", "Qualificação", "Fase Anterior"]
+CARD_ORDER = ["Lead", "Negócio (Lead Qualificado)", "Negócio Ganho", "Lead Desqualificado"]
+
+
+def render_extra_dims(deals_f):
+    """Dimensões extras (TS Shara): Status do Cartão, Canal, Campanha, Fonte/Origem etc.
+    Aparece só quando o ambiente tem essas dimensões no EXTRA."""
+    present = [c for c in EXTRA_CAT_DIMS if c in deals_f.columns]
+    num_dims = [c for c in deals_f.columns if c.startswith("Tempo")]
+    if deals_f.empty or not (present or num_dims):
+        return
+    st.markdown("#### Status do cartão e canais")
+    if "Status do Cartão" in deals_f.columns:
+        sc = deals_f["Status do Cartão"].value_counts()
+        cols = st.columns(len(CARD_ORDER))
+        for i, k in enumerate(CARD_ORDER):
+            cols[i].metric(k, fmt_int(sc.get(k, 0)))
+    for nd in num_dims:
+        s = pd.to_numeric(deals_f[nd], errors="coerce").dropna()
+        if len(s):
+            st.metric(nd, f"{s.mean():.1f}")
+    cat = [c for c in present if c != "Status do Cartão"]
+    cc = st.columns(2)
+    for i, dim in enumerate(cat):
+        dim_bar(cc[i % 2], deals_f, dim, dim)
 
 
 def render_produtos(prod_f):

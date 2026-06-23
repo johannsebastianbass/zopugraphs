@@ -492,7 +492,8 @@ def render_dashboard(tenant: dict, user: dict):
             st.dataframe(prod_f, width='stretch', hide_index=True)
 
 
-EXTRA_CAT_DIMS = ["Status do Cartão", "Canal", "Fonte/Origem", "Campanha", "Qualificação", "Fase Anterior"]
+EXTRA_CAT_DIMS = ["Status do Cartão", "Canal", "Fonte/Origem", "Campanha", "Estado",
+                  "Qualificação", "Fase Anterior"]
 CARD_ORDER = ["Lead", "Negócio (Lead Qualificado)", "Negócio Ganho", "Lead Desqualificado"]
 
 

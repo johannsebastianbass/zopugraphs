@@ -124,7 +124,7 @@ class BitrixClient:
         select = [
             "ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "OPPORTUNITY",
             "CURRENCY_ID", "ASSIGNED_BY_ID", "DATE_CREATE", "DATE_MODIFY",
-            "BEGINDATE", "CLOSEDATE", "CLOSED", "SOURCE_ID",
+            "BEGINDATE", "CLOSEDATE", "CLOSED", "SOURCE_ID", "COMPANY_ID",
         ] + list(extra_select or [])
         flt: Dict[str, Any] = {}
         if category_id is not None:
@@ -177,20 +177,46 @@ class BitrixClient:
             start = nxt
         return results
 
-    def get_deal_productrows(self, deal_ids: List[str]) -> List[Dict[str, Any]]:
-        """Linhas de produto de vários negócios usando `batch` (até 50 por chamada).
-        Cada linha vem com OWNER_ID = ID do negócio."""
+    def _productrows_batch(self, method: str, ids: List[str]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
+        ids = [str(x) for x in ids]
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            cmd = {f"r{j}": f"{method}?" + urlencode({"id": x}) for j, x in enumerate(chunk)}
+            res = self.call("batch", {"halt": 0, "cmd": cmd}).get("result", {}).get("result", {})
+            for j in range(len(chunk)):
+                for r in (res.get(f"r{j}") or []):
+                    rows.append(r)
+        return rows
+
+    def get_deal_productrows(self, deal_ids: List[str]) -> List[Dict[str, Any]]:
+        """Linhas de produto de negócios (OWNER_ID = ID do negócio)."""
+        return self._productrows_batch("crm.deal.productrows.get", deal_ids)
+
+    def get_quote_productrows(self, quote_ids: List[str]) -> List[Dict[str, Any]]:
+        """Linhas de produto de orçamentos (OWNER_ID = ID do orçamento)."""
+        return self._productrows_batch("crm.quote.productrows.get", quote_ids)
+
+    def get_quotes_for_deals(self, deal_ids: List[str]) -> List[Dict[str, Any]]:
+        """Orçamentos (ID, DEAL_ID) dos negócios informados, em lotes de 50 via @DEAL_ID."""
+        out: List[Dict[str, Any]] = []
         ids = [str(x) for x in deal_ids]
         for i in range(0, len(ids), 50):
             chunk = ids[i:i + 50]
-            cmd = {f"d{j}": "crm.deal.productrows.get?" + urlencode({"id": x})
-                   for j, x in enumerate(chunk)}
-            res = self.call("batch", {"halt": 0, "cmd": cmd}).get("result", {}).get("result", {})
-            for j in range(len(chunk)):
-                for r in (res.get(f"d{j}") or []):
-                    rows.append(r)
-        return rows
+            out.extend(self.call_list("crm.quote.list",
+                                      {"filter": {"@DEAL_ID": chunk}, "select": ["ID", "DEAL_ID"]}))
+        return out
+
+    def get_companies_field(self, company_ids: List[str], field: str) -> Dict[str, Any]:
+        """Devolve {COMPANY_ID: valor_do_campo} buscando em lotes de 50 via @ID."""
+        out: Dict[str, Any] = {}
+        ids = [str(x) for x in company_ids if x and str(x) != "0"]
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            for r in self.call_list("crm.company.list",
+                                    {"filter": {"@ID": chunk}, "select": ["ID", field]}):
+                out[str(r["ID"])] = r.get(field)
+        return out
 
     # ---------- Metadados de campos personalizados ----------
 

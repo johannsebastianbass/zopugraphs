@@ -76,15 +76,19 @@ def _truthy(v) -> bool:
     return str(v).strip().lower() in ("1", "y", "true", "sim", "yes")
 
 
-def enrich_deals(deals, fmap, deal_enums, stage_name_map, camp_map):
+def enrich_deals(deals, fmap, deal_enums, stage_name_map, camp_map, company_estado=None):
     """Resolve dimensões extras por negócio e grava em d['EXTRA'] (JSON),
     além de SEGMENTO (via Objetivo) e Status do Cartão (Lead vs Negócio).
     Genérico: tudo é dirigido pelo FIELD_MAP do tenant."""
     dims = fmap.get("deal_dims", [])
     seg_obj = fmap.get("segmento_objetivo")
     card = fmap.get("card_status")
+    estado_field = fmap.get("estado_company_field")
+    company_estado = company_estado or {}
     for d in deals:
         extra = {}
+        if estado_field:
+            extra["Estado"] = company_estado.get(str(d.get("COMPANY_ID"))) or None
         for dim in dims:
             raw = d.get(dim["field"])
             t = dim.get("type", "string")
@@ -226,9 +230,18 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     for d in deals:
         d["SEGMENTO"] = _resolve(d.get(dmap.get("segmento")), deal_enums.get(dmap.get("segmento")))
         d["MOTIVO"] = _resolve(d.get(dmap.get("motivo")), deal_enums.get(dmap.get("motivo")))
+    # Estado (campo na empresa) — resolve company_id -> estado para os negócios carregados
+    company_estado = {}
+    estado_field = fmap.get("estado_company_field")
+    if estado_field:
+        cids = list({str(d.get("COMPANY_ID")) for d in deals if d.get("COMPANY_ID")})
+        try:
+            company_estado = client.get_companies_field(cids, estado_field)
+        except BitrixError:
+            company_estado = {}
     # dimensões extras + segmento por objetivo + Status do Cartão (dirigido pelo FIELD_MAP)
-    if deal_dims or card or seg_obj:
-        enrich_deals(deals, fmap, deal_enums, stage_name_map, camp_map)
+    if deal_dims or card or seg_obj or estado_field:
+        enrich_deals(deals, fmap, deal_enums, stage_name_map, camp_map, company_estado)
     for l in leads:
         l["SEGMENTO"] = _resolve(l.get(lmap.get("segmento")), lead_enums.get(lmap.get("segmento")))
         l["CARGO"] = _resolve(l.get(lmap.get("cargo")), lead_enums.get(lmap.get("cargo")))
@@ -238,9 +251,26 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
     nl = db.upsert_leads(tid, leads)
     # linhas de produto dos negócios que vieram nesta sincronização
     deal_ids_synced = [str(d.get("ID")) for d in deals]
-    if fmap.get("skip_deal_products"):
-        npr = 0  # tenant usa produtos de orçamento (quote), não do negócio
-    else:
+    npr = 0
+    if fmap.get("quote_products"):
+        # produtos vêm dos orçamentos (crm.quote) ligados aos negócios
+        try:
+            quotes = client.get_quotes_for_deals(deal_ids_synced) if deal_ids_synced else []
+            q2d = {str(q["ID"]): str(q["DEAL_ID"]) for q in quotes}
+            raw = client.get_quote_productrows(list(q2d.keys())) if q2d else []
+            rows = []
+            for r in raw:
+                price = float(r.get("PRICE") or 0)
+                qty = float(r.get("QUANTITY") or 0)
+                rows.append({"ID": str(r.get("ID")), "DEAL_ID": q2d.get(str(r.get("OWNER_ID"))),
+                             "PRODUCT_ID": str(r.get("PRODUCT_ID")), "PRODUCT_NAME": r.get("PRODUCT_NAME"),
+                             "PRICE": price, "QUANTITY": qty, "TOTAL": price * qty})
+            rows = [r for r in rows if r["DEAL_ID"]]
+            db.replace_products(tid, deal_ids_synced, rows)
+            npr = len(rows)
+        except BitrixError:
+            npr = 0
+    elif not fmap.get("skip_deal_products"):
         try:
             prod_rows = _product_rows(client.get_deal_productrows(deal_ids_synced)) if deal_ids_synced else []
             db.replace_products(tid, deal_ids_synced, prod_rows)

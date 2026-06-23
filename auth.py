@@ -38,9 +38,9 @@ def authenticate(username: str, password: str) -> Optional[dict]:
 
 
 def create_user(username: str, password: str, role: str = "client",
-                tenant_id: Optional[int] = None, name: str = "") -> int:
+                tenant_id: Optional[int] = None, name: str = "", scope: str = "all") -> int:
     salt, h = hash_password(password)
-    return db.add_user(username, h, salt, role, tenant_id, name)
+    return db.add_user(username, h, salt, role, tenant_id, name, scope)
 
 
 def change_password(username: str, new_password: str) -> None:

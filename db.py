@@ -75,6 +75,7 @@ def init_db() -> None:
                 ROLE TEXT NOT NULL DEFAULT 'client',   -- 'master' | 'client'
                 TENANT_ID INTEGER,
                 NAME TEXT,
+                SCOPE TEXT NOT NULL DEFAULT 'all',      -- 'all' | 'comercial' | 'sac'
                 ACTIVE INTEGER NOT NULL DEFAULT 1,
                 CREATED_AT TEXT
             );
@@ -155,6 +156,7 @@ def init_db() -> None:
         _ensure_col(c, "leads", "CARGO", "TEXT")
         _ensure_col(c, "leads", "MOTIVO", "TEXT")
         _ensure_col(c, "tenants", "FIELD_MAP", "TEXT")
+        _ensure_col(c, "app_users", "SCOPE", "TEXT")
 
 
 def _ensure_col(conn, table: str, col: str, decl: str) -> None:
@@ -215,15 +217,20 @@ def set_field_map(tenant_id: int, field_map: Dict[str, Any]) -> None:
 
 # ---------------------------------------------------------------- users
 def add_user(username: str, password_hash: str, salt: str, role: str,
-             tenant_id: Optional[int], name: str = "") -> int:
+             tenant_id: Optional[int], name: str = "", scope: str = "all") -> int:
     with get_conn() as c:
         cur = c.execute(
             "INSERT INTO app_users (USERNAME, PASSWORD_HASH, SALT, ROLE, TENANT_ID, NAME,"
-            " ACTIVE, CREATED_AT) VALUES (?,?,?,?,?,?,1,?)",
-            (username, password_hash, salt, role, tenant_id, name,
+            " SCOPE, ACTIVE, CREATED_AT) VALUES (?,?,?,?,?,?,?,1,?)",
+            (username, password_hash, salt, role, tenant_id, name, scope,
              datetime.now().isoformat(timespec="seconds")),
         )
         return cur.lastrowid
+
+
+def set_user_scope(username: str, scope: str) -> None:
+    with get_conn() as c:
+        c.execute("UPDATE app_users SET SCOPE=? WHERE USERNAME=?", (scope, username))
 
 
 def get_user(username: str) -> Optional[Dict[str, Any]]:

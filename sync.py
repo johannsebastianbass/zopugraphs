@@ -122,22 +122,120 @@ def enrich_deals(deals, fmap, deal_enums, stage_name_map, camp_map, company_esta
         # Status do Cartão (CRM com lead e negócio misturados nas fases)
         if card:
             stage = stage_name_map.get(d.get("STAGE_ID"), d.get("STAGE_ID"))
-            qual = _truthy(d.get(card["qual_field"]))
-            fant = extra.get(card.get("fase_anterior_key", "Fase Anterior"))
             won, lost, qual_st = card["won"], card["lost"], card["qualified"]
-            if stage in won:
-                cs = "Negócio Ganho"
-            elif stage in lost and qual:
-                cs = "Negócio (Lead Qualificado)"
-            elif stage in lost:
-                cs = "Lead Desqualificado"
-            elif stage in qual_st or fant in qual_st:
-                cs = "Negócio (Lead Qualificado)"
+            if card.get("mode") == "sac":
+                novo = card.get("novo", [])
+                if stage in won:
+                    cs = "Negócio Ganho"
+                elif stage in lost:
+                    cs = "Negócio Perdido"
+                elif stage in qual_st:
+                    cs = "Negócio (Lead Qualificado)"
+                elif stage in novo:
+                    cs = "Lead"
+                else:
+                    cs = "Lead"
             else:
-                cs = "Lead"
+                qual = _truthy(d.get(card["qual_field"]))
+                fant = extra.get(card.get("fase_anterior_key", "Fase Anterior"))
+                if stage in won:
+                    cs = "Negócio Ganho"
+                elif stage in lost and qual:
+                    cs = "Negócio (Lead Qualificado)"
+                elif stage in lost:
+                    cs = "Lead Desqualificado"
+                elif stage in qual_st or fant in qual_st:
+                    cs = "Negócio (Lead Qualificado)"
+                else:
+                    cs = "Lead"
             extra["Status do Cartão"] = cs
         d["EXTRA"] = json.dumps(extra, ensure_ascii=False)
     return deals
+
+
+def sync_sac(tenant: dict, created_since: Optional[str] = None,
+             window_hours: float = WINDOW_HOURS) -> dict:
+    """Sincroniza o pipeline SAC / Assistência Técnica (2º funil de deals) para
+    tenants que têm bloco 'sac' no FIELD_MAP. Carrega deals (categoria do SAC),
+    dimensões/Status do Cartão (modo sac), produtos (linhas do deal) e Estado."""
+    tid = tenant["ID"]
+    fmap = db.get_field_map(tid)
+    sac = fmap.get("sac")
+    if not sac:
+        return {"tenant": tenant["NAME"], "ok": False, "error": "sem config SAC"}
+    cat = str(sac["category"])
+    client = BitrixClient(tenant["WEBHOOK"])
+    sac_fmap = {  # reaproveita enrich_deals com a config do SAC
+        "deal_dims": sac.get("deal_dims", []),
+        "card_status": sac.get("card_status"),
+        "segmento_objetivo": sac.get("segmento_objetivo"),
+        "estado_company_field": sac.get("estado_company_field"),
+        "deal": {"motivo": sac.get("motivo")},
+    }
+    dims = sac.get("deal_dims", [])
+    try:
+        status_map = client.get_status_map()
+        deal_fields = client.get_fields("deal")
+        enum_codes = [d["field"] for d in dims if d.get("type") == "enum"]
+        if sac.get("motivo"):
+            enum_codes.append(sac["motivo"])
+        deal_enums = client.enum_maps(deal_fields, enum_codes)
+    except BitrixError as e:
+        return {"tenant": tenant["NAME"], "ok": False, "error": str(e)}
+
+    stage_name_map = status_map.get(f"DEAL_STAGE_{cat}", {})
+    have_cat = _count_cat(tid, cat)
+    if created_since:
+        modified_since = None
+    elif have_cat == 0:
+        modified_since = None
+    else:
+        modified_since = _cutoff_iso(window_hours)
+
+    extra_codes = [d["field"] for d in dims]
+    if sac.get("motivo"):
+        extra_codes.append(sac["motivo"])
+    if sac.get("segmento_objetivo"):
+        extra_codes.append(sac["segmento_objetivo"])
+    extra_codes = list(dict.fromkeys(c for c in extra_codes if c))
+
+    try:
+        deals = client.get_deals(category_id=cat, modified_since=modified_since,
+                                 created_since=created_since, extra_select=extra_codes)
+    except BitrixError as e:
+        return {"tenant": tenant["NAME"], "ok": False, "error": str(e)}
+
+    # Estado da empresa
+    company_estado = {}
+    if sac.get("estado_company_field"):
+        cids = list({str(d.get("COMPANY_ID")) for d in deals if d.get("COMPANY_ID")})
+        try:
+            company_estado = client.get_companies_field(cids, sac["estado_company_field"])
+        except BitrixError:
+            company_estado = {}
+    for d in deals:
+        d["MOTIVO"] = _resolve(d.get(sac.get("motivo")), deal_enums.get(sac.get("motivo")))
+    enrich_deals(deals, sac_fmap, deal_enums, stage_name_map, {}, company_estado)
+    nd = db.upsert_deals(tid, deals)
+
+    # produtos das linhas do deal (SAC usa produtos do próprio chamado)
+    deal_ids = [str(d.get("ID")) for d in deals]
+    npr = 0
+    try:
+        rows = _product_rows(client.get_deal_productrows(deal_ids)) if deal_ids else []
+        db.replace_products(tid, deal_ids, rows)
+        npr = len(rows)
+    except BitrixError:
+        npr = 0
+    total = db.count_records(tid)
+    db.set_sync(tid, total["deals"], total["leads"], note=f"SAC: +{nd} chamados, {npr} produtos")
+    return {"tenant": tenant["NAME"], "ok": True, "sac_deals": nd, "sac_products": npr}
+
+
+def _count_cat(tenant_id: int, category_id: str) -> int:
+    with db.get_conn() as c:
+        return c.execute("SELECT COUNT(*) FROM deals WHERE TENANT_ID=? AND CATEGORY_ID=?",
+                         (tenant_id, str(category_id))).fetchone()[0]
 
 
 def sync_products(tenant: dict) -> int:

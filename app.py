@@ -65,8 +65,13 @@ def build_deals_df(df, status_map, user_map, category_id) -> pd.DataFrame:
     df["CLOSEDATE"] = to_dt(df["CLOSEDATE"])
     df["ASSIGNED_BY_ID"] = df["ASSIGNED_BY_ID"].astype(str)
     df["Vendedor"] = df["ASSIGNED_BY_ID"].map(user_map).fillna("ID " + df["ASSIGNED_BY_ID"])
-    stage_names = status_map.get(f"DEAL_STAGE_{category_id}") or status_map.get("DEAL_STAGE", {})
-    df["Estágio"] = df["STAGE_ID"].map(stage_names).fillna(df["STAGE_ID"])
+    # estágio resolvido por categoria do negócio (suporta múltiplos pipelines)
+    df["CATEGORY_ID"] = df["CATEGORY_ID"].astype(str)
+    df["Estágio"] = df["STAGE_ID"]
+    for cat in df["CATEGORY_ID"].unique():
+        m = status_map.get(f"DEAL_STAGE_{cat}") or status_map.get("DEAL_STAGE", {})
+        mask = df["CATEGORY_ID"] == cat
+        df.loc[mask, "Estágio"] = df.loc[mask, "STAGE_ID"].map(m).fillna(df.loc[mask, "STAGE_ID"])
     src = status_map.get("SOURCE", {})
     df["Fonte"] = df["SOURCE_ID"].map(src).fillna(df["SOURCE_ID"]).fillna("—")
 
@@ -238,6 +243,25 @@ def render_dashboard(tenant: dict, user: dict):
     deals_all, leads_all, spa_all, prod_all = load_frames(
         tenant["ID"], cat_id, tuple(s["entity_type_id"] for s in spas), cache_key)
     n_spa = sum(len(v) for v in spa_all.values())
+
+    # ---------------- modo Comercial x SAC (escopo do usuário) ----------------
+    sac_cfg = fmap.get("sac")
+    scope = (user.get("SCOPE") or "all")
+    mode = "Comercial"
+    if sac_cfg:
+        if scope == "sac":
+            mode = "SAC"
+        elif scope == "comercial":
+            mode = "Comercial"
+        else:
+            mode = st.sidebar.radio("Visão", ["Comercial", "SAC"], horizontal=True)
+    if mode == "SAC":
+        render_sac(deals_all, prod_all, status_map, sac_cfg, tenant)
+        return
+    # Comercial: restringe aos negócios do funil comercial (exclui SAC e outros)
+    if not deals_all.empty:
+        deals_all = deals_all[deals_all["CATEGORY_ID"].astype(str) == str(cat_id)]
+
     st.title(f"📊 {tenant['NAME']}")
     info = (f"Funil: **{cat_name}** · {len(deals_all)} negócios · {len(leads_all)} leads"
             f" · {n_spa} itens SPA")
@@ -518,6 +542,96 @@ def render_extra_dims(deals_f):
     cc = st.columns(2)
     for i, dim in enumerate(cat):
         dim_bar(cc[i % 2], deals_f, dim, dim)
+
+
+SAC_SIT = {"Aberto": "Em andamento", "Ganho": "Resolvido", "Perdido": "Não resolvido"}
+SAC_COLORS = {"Resolvido": WON_COLOR, "Não resolvido": LOST_COLOR, "Em andamento": OPEN_COLOR}
+
+
+def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
+    cat = str(sac_cfg["category"])
+    d = deals_all[deals_all["CATEGORY_ID"] == cat].copy() if not deals_all.empty else deals_all
+    st.title(f"🔧 {tenant['NAME']} · SAC / Assistência Técnica")
+    if d.empty:
+        st.info("Sem chamados de assistência técnica sincronizados.")
+        return
+    dts = d["DATE_CREATE"].dropna()
+    if not dts.empty:
+        dmin, dmax = dts.min().date(), dts.max().date()
+        rng = st.sidebar.date_input("Período (abertura)", value=(dmin, dmax),
+                                    min_value=dmin, max_value=dmax)
+        if isinstance(rng, tuple) and len(rng) == 2:
+            ds = d["DATE_CREATE"].dt.date
+            d = d[(ds >= rng[0]) & (ds <= rng[1])]
+    st.caption(f"{len(d)} chamados · pipeline Assistência Técnica")
+
+    total = len(d)
+    resolvido = int((d["Situação"] == "Ganho").sum())
+    naores = int((d["Situação"] == "Perdido").sum())
+    andamento = int((d["Situação"] == "Aberto").sum())
+    pct = (resolvido / (resolvido + naores) * 100) if (resolvido + naores) else 0
+    tempo_col = next((c for c in d.columns if c.startswith("Tempo")), None)
+    tempo = pd.to_numeric(d[tempo_col], errors="coerce").dropna().mean() if tempo_col else None
+
+    r = st.columns(4)
+    r[0].metric("📋 Criados", fmt_int(total))
+    r[1].metric("⏳ Em andamento", fmt_int(andamento))
+    r[2].metric("✅ Resolvidos", fmt_int(resolvido))
+    r[3].metric("❌ Não resolvidos", fmt_int(naores))
+    r2 = st.columns(4)
+    r2[0].metric("🎯 % Resolução", f"{pct:.1f}%")
+    r2[1].metric("⏱️ Tempo médio (min)", f"{tempo:.1f}" if tempo is not None and tempo == tempo else "—")
+    st.divider()
+
+    tabs = st.tabs(["📊 Visão geral", "🔧 Defeitos & interação", "🛍️ Produtos", "🗂️ Dados"])
+    with tabs[0]:
+        cc = st.columns(2)
+        sit = (d.groupby("Situação").size().reindex(["Aberto", "Ganho", "Perdido"])
+               .fillna(0).reset_index(name="Qtde"))
+        sit["Situação"] = sit["Situação"].map(SAC_SIT)
+        fig = px.pie(sit, names="Situação", values="Qtde", hole=0.5, color="Situação",
+                     color_discrete_map=SAC_COLORS)
+        fig.update_layout(title="Resolução", height=380, margin=dict(l=10, r=10, t=50, b=10))
+        cc[0].plotly_chart(fig, width="stretch")
+        dim_bar(cc[1], d, "Estágio", "Chamados por estágio")
+        bym = d.groupby(["Mês criação", "Situação"]).size().reset_index(name="Qtde")
+        bym = bym[bym["Mês criação"] != "NaT"]
+        bym["Situação"] = bym["Situação"].map(SAC_SIT)
+        if not bym.empty:
+            figm = px.bar(bym, x="Mês criação", y="Qtde", color="Situação", barmode="stack",
+                          color_discrete_map=SAC_COLORS)
+            figm.update_layout(title="Status por mês", height=360, margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(figm, width="stretch")
+
+    with tabs[1]:
+        cc = st.columns(2)
+        dim_bar(cc[0], d, "Tipo de Interação", "Tipo de interação")
+        dim_bar(cc[1], d, "Modo de Falha", "Modo de falha de reclamação")
+        cc2 = st.columns(2)
+        dim_bar(cc2[0], d, "Defeitos", "Defeitos", top=21)
+        dim_bar(cc2[1], d, "Sugestão", "Sugestão")
+        dim_bar(st, d, "Resolução", "Resolução", top=12)
+
+    with tabs[2]:
+        ids = set(d["ID"])
+        p = prod_all[prod_all["DEAL_ID"].isin(ids)] if not prod_all.empty else prod_all
+        if p.empty:
+            st.info("Sem produtos lançados nos chamados.")
+        else:
+            g = (p.groupby("PRODUCT_NAME").agg(
+                Criados=("DEAL_ID", "nunique"),
+                Resolvidos=("Situação", lambda s: int((s == "Ganho").sum())),
+                Não_Resolvidos=("Situação", lambda s: int((s == "Perdido").sum()))).reset_index())
+            g["Resolução %"] = (g["Resolvidos"] / g["Criados"] * 100).round(1)
+            g = g.sort_values("Criados", ascending=False)
+            g.columns = ["Produto", "Criados", "Resolvidos", "Não Resolvidos", "Resolução %"]
+            st.markdown("#### Produtos em chamados")
+            st.dataframe(g.head(50), width="stretch", hide_index=True)
+
+    with tabs[3]:
+        st.download_button("⬇️ Chamados (CSV)", d.to_csv(index=False).encode("utf-8-sig"),
+                           "sac_chamados.csv", "text/csv")
+        st.dataframe(d, width="stretch", hide_index=True)
 
 
 def render_produtos(prod_f):

@@ -292,23 +292,72 @@ def render_dashboard(tenant: dict, user: dict):
     fontes = sorted(set(deals_all.get("Fonte", [])) | set(leads_all.get("Fonte", [])))
     sel_fonte = st.sidebar.multiselect("Fonte", fontes, default=fontes)
 
+    # filtros adicionais (aplicam só aos negócios/produtos, não a leads/SPAs)
+    def _opts(col):
+        if col in deals_all.columns:
+            return sorted(deals_all[col].dropna().astype(str).unique().tolist())
+        return []
+
+    sit_opts = _opts("Situação")
+    sel_sit = st.sidebar.multiselect("Situação", sit_opts, default=sit_opts) if sit_opts else None
+    est_opts = _opts("Estágio")
+    with st.sidebar.expander("Mais filtros de negócios"):
+        sel_est = st.multiselect("Estágio", est_opts, default=est_opts) if est_opts else None
+        seg_opts = _opts("SEGMENTO")
+        sel_seg = st.multiselect("Segmento", seg_opts, default=seg_opts) if seg_opts else None
+        card_opts = _opts("Status do Cartão")
+        sel_card = st.multiselect("Status do Cartão", card_opts, default=card_opts) if card_opts else None
+        canal_opts = _opts("Canal")
+        sel_canal = st.multiselect("Canal", canal_opts, default=canal_opts) if canal_opts else None
+        estado_opts = _opts("Estado")
+        sel_estado = st.multiselect("Estado", estado_opts, default=estado_opts) if estado_opts else None
+        # faixa de valor
+        vmax = float(deals_all["OPPORTUNITY"].max()) if "OPPORTUNITY" in deals_all.columns and len(deals_all) else 0.0
+        val_range = None
+        if vmax > 0:
+            val_range = st.slider("Valor (R$)", 0.0, vmax, (0.0, vmax))
+
     def flt(df, use_date=True):
+        """Filtros comuns (data, vendedor, fonte) — seguros para qualquer entidade."""
         if df.empty:
             return df
         m = pd.Series(True, index=df.index)
-        if use_date and d0 is not None:
+        if use_date and d0 is not None and "DATE_CREATE" in df.columns:
             ds = df["DATE_CREATE"].dt.date
             m &= (ds >= d0) & (ds <= d1)
-        if sel_vend:
+        if sel_vend and "Vendedor" in df.columns:
             m &= df["Vendedor"].isin(sel_vend)
-        if sel_fonte:
+        if sel_fonte and "Fonte" in df.columns:
             m &= df["Fonte"].isin(sel_fonte)
         return df[m]
 
-    deals_f, leads_f = flt(deals_all), flt(leads_all)
-    deals_t, leads_t = flt(deals_all, use_date=False), flt(leads_all, use_date=False)
+    def deal_filter(df):
+        """Filtros específicos de negócios/produtos (situação, estágio, segmento...)."""
+        if df.empty:
+            return df
+        m = pd.Series(True, index=df.index)
+        if sel_sit is not None and "Situação" in df.columns:
+            m &= df["Situação"].astype(str).isin(sel_sit)
+        if sel_est is not None and "Estágio" in df.columns:
+            m &= df["Estágio"].astype(str).isin(sel_est)
+        if sel_seg is not None and "SEGMENTO" in df.columns:
+            m &= df["SEGMENTO"].astype(str).isin(sel_seg)
+        if sel_card is not None and "Status do Cartão" in df.columns:
+            m &= df["Status do Cartão"].astype(str).isin(sel_card)
+        if sel_canal is not None and "Canal" in df.columns:
+            m &= df["Canal"].astype(str).isin(sel_canal)
+        if sel_estado is not None and "Estado" in df.columns:
+            m &= df["Estado"].astype(str).isin(sel_estado)
+        if val_range is not None and "OPPORTUNITY" in df.columns:
+            m &= df["OPPORTUNITY"].between(val_range[0], val_range[1])
+        return df[m]
+
+    deals_f = deal_filter(flt(deals_all))
+    leads_f = flt(leads_all)
+    deals_t = deal_filter(flt(deals_all, use_date=False))
+    leads_t = flt(leads_all, use_date=False)
     spa_f = {et: flt(df) for et, df in spa_all.items()}
-    prod_f = flt(prod_all)
+    prod_f = deal_filter(flt(prod_all))
 
     won = deals_f[deals_f["Situação"] == "Ganho"]
     lost = deals_f[deals_f["Situação"] == "Perdido"]

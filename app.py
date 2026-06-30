@@ -597,11 +597,21 @@ def render_dashboard(tenant: dict, user: dict):
         sel_canal = st.multiselect("Canal", canal_opts, default=canal_opts) if canal_opts else None
         estado_opts = _opts("Estado")
         sel_estado = st.multiselect("Estado", estado_opts, default=estado_opts) if estado_opts else None
+        # família de produto (atributo do produto -> filtra negócios que têm produto dessa família)
+        fam_opts = (sorted(prod_all["Família"].dropna().astype(str).unique().tolist())
+                    if (not prod_all.empty and "Família" in prod_all.columns) else [])
+        sel_fam = st.multiselect("Família de produto", fam_opts, default=fam_opts) if fam_opts else None
         # faixa de valor
         vmax = float(deals_all["OPPORTUNITY"].max()) if "OPPORTUNITY" in deals_all.columns and len(deals_all) else 0.0
         val_range = None
         if vmax > 0:
             val_range = st.slider("Valor (R$)", 0.0, vmax, (0.0, vmax))
+
+    # negócios que têm produto nas famílias selecionadas (None = sem filtro de família)
+    fam_deal_ids = None
+    if sel_fam is not None and fam_opts and set(sel_fam) != set(fam_opts):
+        fam_deal_ids = set(prod_all.loc[prod_all["Família"].astype(str).isin(sel_fam),
+                                        "DEAL_ID"].astype(str))
 
     def flt(df, use_date=True):
         """Filtros comuns (data, vendedor, fonte) — seguros para qualquer entidade.
@@ -640,6 +650,11 @@ def render_dashboard(tenant: dict, user: dict):
             m &= df["Estado"].astype(str).isin(sel_estado)
         if val_range is not None and "OPPORTUNITY" in df.columns:
             m &= df["OPPORTUNITY"].between(val_range[0], val_range[1])
+        # família: produtos filtram pela própria coluna; negócios pelos IDs com a família
+        if sel_fam is not None and "Família" in df.columns:
+            m &= df["Família"].astype(str).isin(sel_fam)
+        elif fam_deal_ids is not None and "ID" in df.columns:
+            m &= df["ID"].astype(str).isin(fam_deal_ids)
         return df[m]
 
     deals_f = deal_filter(flt(deals_all))

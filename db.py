@@ -157,6 +157,7 @@ def init_db() -> None:
         _ensure_col(c, "leads", "MOTIVO", "TEXT")
         _ensure_col(c, "tenants", "FIELD_MAP", "TEXT")
         _ensure_col(c, "app_users", "SCOPE", "TEXT")
+        _ensure_col(c, "tenant_meta", "FAMILY_MAP", "TEXT")
 
 
 def _ensure_col(conn, table: str, col: str, decl: str) -> None:
@@ -391,6 +392,30 @@ def products_df(tenant_id: int) -> pd.DataFrame:
         return pd.read_sql_query(
             f"SELECT {','.join(PRODUCT_COLS)} FROM products WHERE TENANT_ID=?", c, params=(tenant_id,)
         )
+
+
+def product_ids(tenant_id: int) -> List[str]:
+    with get_conn() as c:
+        return [r[0] for r in c.execute(
+            "SELECT DISTINCT PRODUCT_ID FROM products WHERE TENANT_ID=? AND PRODUCT_ID IS NOT NULL",
+            (tenant_id,)) if r[0]]
+
+
+def save_family_map(tenant_id: int, family_map: Dict[str, Any]) -> None:
+    with get_conn() as c:
+        c.execute("UPDATE tenant_meta SET FAMILY_MAP=? WHERE TENANT_ID=?",
+                  (json.dumps(family_map, ensure_ascii=False), tenant_id))
+
+
+def get_family_map(tenant_id: int) -> Dict[str, Any]:
+    with get_conn() as c:
+        r = c.execute("SELECT FAMILY_MAP FROM tenant_meta WHERE TENANT_ID=?", (tenant_id,)).fetchone()
+    if r and r[0]:
+        try:
+            return json.loads(r[0])
+        except (ValueError, TypeError):
+            return {}
+    return {}
 
 
 def count_records(tenant_id: int) -> Dict[str, int]:

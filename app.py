@@ -278,7 +278,7 @@ def maybe_autosync(tenant: dict):
 
 
 # ====================================================================== dashboard
-def build_products_df(prod, deals) -> pd.DataFrame:
+def build_products_df(prod, deals, family_map=None) -> pd.DataFrame:
     """Junta as linhas de produto com os dados do negócio (situação, vendedor,
     fonte, data) para permitir filtros e análise de produtos ganhos."""
     if prod.empty:
@@ -286,6 +286,8 @@ def build_products_df(prod, deals) -> pd.DataFrame:
     prod = prod.copy()
     prod["TOTAL"] = pd.to_numeric(prod["TOTAL"], errors="coerce").fillna(0.0)
     prod["QUANTITY"] = pd.to_numeric(prod["QUANTITY"], errors="coerce").fillna(0.0)
+    fm = family_map or {}
+    prod["Família"] = prod["PRODUCT_ID"].astype(str).map(fm).fillna("N/A")
     cols = ["ID", "Situação", "Vendedor", "Fonte", "DATE_CREATE"]
     info = deals[cols].rename(columns={"ID": "DEAL_ID"}) if not deals.empty else \
         pd.DataFrame(columns=["DEAL_ID", "Situação", "Vendedor", "Fonte", "DATE_CREATE"])
@@ -302,7 +304,7 @@ def load_frames(tenant_id: int, cat_id: str, spa_ids: tuple, cache_key: str):
     deals = build_deals_df(db.deals_df(tenant_id), sm, um, cat_id, won_stages=won_stages)
     leads = build_leads_df(db.leads_df(tenant_id), sm, um)
     spa = {et: build_spa_df(db.spa_items_df(tenant_id, et), sm, um, et) for et in spa_ids}
-    products = build_products_df(db.products_df(tenant_id), deals)
+    products = build_products_df(db.products_df(tenant_id), deals, db.get_family_map(tenant_id))
     return deals, leads, spa, products
 
 
@@ -933,6 +935,27 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
                     figdef.update_layout(title="Quantidade de produtos por tipo de defeito",
                                          height=480, margin=dict(l=10, r=10, t=50, b=10))
                     st.plotly_chart(figdef, width="stretch")
+            # família de produto
+            if "Família" in p.columns:
+                st.markdown("#### Família de produto")
+                gf = (p.groupby("Família").agg(
+                    Criados=("DEAL_ID", "nunique"),
+                    Resolvidos=("Situação", lambda s: int((s == "Ganho").sum())),
+                    Qtd=("QUANTITY", "sum")).reset_index())
+                gf["Resolução %"] = (gf["Resolvidos"] / gf["Criados"] * 100).round(1)
+                st.dataframe(gf.sort_values("Criados", ascending=False), width="stretch", hide_index=True)
+                # gráfico de pilha: família × modo de falha
+                if "Modo de Falha" in d.columns:
+                    fmap2 = d.set_index("ID")["Modo de Falha"]
+                    pp2 = p.copy()
+                    pp2["Modo de Falha"] = pp2["DEAL_ID"].map(fmap2).fillna("não selecionada")
+                    gfm = pp2.groupby(["Família", "Modo de Falha"])["QUANTITY"].sum().reset_index()
+                    if not gfm.empty:
+                        figpil = px.bar(gfm, x="Família", y="QUANTITY", color="Modo de Falha",
+                                        barmode="stack")
+                        figpil.update_layout(title="Família × Modo de falha (pilha)", height=460,
+                                             margin=dict(l=10, r=10, t=50, b=10))
+                        st.plotly_chart(figpil, width="stretch")
 
     with tabs[3]:
         st.download_button("⬇️ Chamados (CSV)", d.to_csv(index=False).encode("utf-8-sig"),
@@ -977,6 +1000,26 @@ def render_produtos(prod_f):
     disp["Qtd"] = disp["Qtd"].map(lambda x: f"{x:.0f}")
     disp.columns = ["Produto", "Receita", "Qtd", "Negócios"]
     st.dataframe(disp, width="stretch", hide_index=True)
+
+    # família de produto
+    if "Família" in base.columns:
+        st.markdown("#### Família de produto")
+        gf = (base.groupby("Família").agg(Receita=("TOTAL", "sum"), Qtd=("QUANTITY", "sum"),
+              Negócios=("DEAL_ID", "nunique")).reset_index().sort_values("Receita", ascending=False))
+        cf = st.columns(2)
+        figf = px.bar(gf.sort_values("Receita").tail(15), x="Receita", y="Família",
+                      orientation="h", text_auto=".2s")
+        figf.update_traces(marker_color=WON_COLOR)
+        figf.update_layout(title="Receita por família", height=420, margin=dict(l=10, r=10, t=50, b=10))
+        cf[0].plotly_chart(figf, width="stretch")
+        figq = px.bar(gf.sort_values("Qtd").tail(15), x="Qtd", y="Família", orientation="h", text_auto=True)
+        figq.update_traces(marker_color=OPEN_COLOR)
+        figq.update_layout(title="Quantidade por família", height=420, margin=dict(l=10, r=10, t=50, b=10))
+        cf[1].plotly_chart(figq, width="stretch")
+        gfd = gf.copy()
+        gfd["Receita"] = gfd["Receita"].map(fmt_brl)
+        gfd["Qtd"] = gfd["Qtd"].map(lambda x: f"{x:.0f}")
+        st.dataframe(gfd, width="stretch", hide_index=True)
 
 
 def render_funnel(deals_f, stage_names):

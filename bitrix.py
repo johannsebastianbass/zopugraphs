@@ -207,6 +207,25 @@ class BitrixClient:
                                       {"filter": {"@DEAL_ID": chunk}, "select": ["ID", "DEAL_ID"]}))
         return out
 
+    def get_product_section_names(self) -> Dict[str, str]:
+        """Seções do catálogo de produtos = famílias. Devolve {SECTION_ID: NOME}."""
+        rows = self.call_list("crm.productsection.list", {"select": ["ID", "NAME"]})
+        return {str(r["ID"]): r.get("NAME") for r in rows}
+
+    def get_product_sections(self, product_ids: List[str]) -> Dict[str, Any]:
+        """Devolve {PRODUCT_ID: SECTION_ID} via batch (crm.product.get)."""
+        out: Dict[str, Any] = {}
+        ids = [str(x) for x in product_ids if x and str(x) != "None"]
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            cmd = {f"p{j}": "crm.product.get?" + urlencode({"id": x}) for j, x in enumerate(chunk)}
+            res = self.call("batch", {"halt": 0, "cmd": cmd}).get("result", {}).get("result", {})
+            for j, x in enumerate(chunk):
+                r = res.get(f"p{j}")
+                if r:
+                    out[x] = r.get("SECTION_ID")
+        return out
+
     def get_companies_field(self, company_ids: List[str], field: str) -> Dict[str, Any]:
         """Devolve {COMPANY_ID: valor_do_campo} buscando em lotes de 50 via @ID."""
         out: Dict[str, Any] = {}

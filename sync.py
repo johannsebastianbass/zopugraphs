@@ -227,6 +227,11 @@ def sync_sac(tenant: dict, created_since: Optional[str] = None,
         npr = len(rows)
     except BitrixError:
         npr = 0
+    if fmap.get("resolve_family"):
+        try:
+            sync_families(tenant)
+        except BitrixError:
+            pass
     total = db.count_records(tid)
     db.set_sync(tid, total["deals"], total["leads"], note=f"SAC: +{nd} chamados, {npr} produtos")
     return {"tenant": tenant["NAME"], "ok": True, "sac_deals": nd, "sac_products": npr}
@@ -236,6 +241,24 @@ def _count_cat(tenant_id: int, category_id: str) -> int:
     with db.get_conn() as c:
         return c.execute("SELECT COUNT(*) FROM deals WHERE TENANT_ID=? AND CATEGORY_ID=?",
                          (tenant_id, str(category_id))).fetchone()[0]
+
+
+def sync_families(tenant: dict) -> int:
+    """Resolve a família (seção do catálogo) de cada produto usado e guarda o
+    mapa {product_id: família} em tenant_meta. Roda 1x por sincronização."""
+    tid = tenant["ID"]
+    client = BitrixClient(tenant["WEBHOOK"])
+    pids = db.product_ids(tid)
+    if not pids:
+        return 0
+    try:
+        names = client.get_product_section_names()
+        secs = client.get_product_sections(pids)
+    except BitrixError:
+        return 0
+    fam = {pid: names.get(str(sec)) for pid, sec in secs.items() if sec and names.get(str(sec))}
+    db.save_family_map(tid, fam)
+    return len(fam)
 
 
 def sync_products(tenant: dict) -> int:
@@ -384,6 +407,12 @@ def sync_tenant(tenant: dict, full: bool = False, window_hours: float = WINDOW_H
             "BEGINDATE": m.get("begindate"), "OPPORTUNITY": m.get("opportunity"),
         } for m in items]
         ns += db.upsert_spa_items(tid, et, rows)
+
+    if fmap.get("resolve_family"):
+        try:
+            sync_families(tenant)
+        except BitrixError:
+            pass
 
     total = db.count_records(tid)
     if created_since:

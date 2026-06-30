@@ -163,6 +163,74 @@ def dim_bar(container, df, col, title, color=None, top=15):
     container.plotly_chart(fig, width="stretch")
 
 
+def won_donut(container, df, col, title, top=10):
+    """Donut do valor GANHO (R$) por uma dimensão."""
+    if df.empty or col not in df.columns:
+        container.caption(f"{title}: sem dados.")
+        return
+    w = df[df["Situação"] == "Ganho"].copy()
+    w = w[w[col].notna() & w[col].astype(str).str.strip().ne("") & w[col].astype(str).str.strip().ne("—")]
+    if w.empty or w["OPPORTUNITY"].sum() <= 0:
+        container.caption(f"{title}: sem ganhos informados.")
+        return
+    g = w.groupby(col)["OPPORTUNITY"].sum().sort_values(ascending=False)
+    if len(g) > top:
+        g = pd.concat([g.iloc[:top], pd.Series({"Outros": g.iloc[top:].sum()})])
+    gg = g.reset_index()
+    gg.columns = [col, "Ganho"]
+    fig = px.pie(gg, names=col, values="Ganho", hole=0.5)
+    fig.update_layout(title=f"Ganho por {title} (R$)", height=360, margin=dict(l=10, r=10, t=50, b=10))
+    container.plotly_chart(fig, width="stretch")
+
+
+def conversion_table(df, dim):
+    """Tabela de conversão por dimensão: Criados, Ganhos, Perdidos, Valor ganho, Conversão %."""
+    b = df.copy()
+    b["_g"] = (b["Situação"] == "Ganho").astype(int)
+    b["_p"] = (b["Situação"] == "Perdido").astype(int)
+    b["_vg"] = b["OPPORTUNITY"].where(b["Situação"] == "Ganho", 0.0)
+    g = b.groupby(dim).agg(Criados=("ID", "count"), Ganhos=("_g", "sum"),
+                           Perdidos=("_p", "sum"), Valor=("_vg", "sum")).reset_index()
+    g["Conversão %"] = (g["Ganhos"] / g["Criados"].replace(0, float("nan")) * 100).round(1)
+    return g.sort_values("Criados", ascending=False)
+
+
+def _conv_table_display(t, dim, label):
+    show = t.copy()
+    show["Valor"] = show["Valor"].map(fmt_brl)
+    show["Conversão %"] = show["Conversão %"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
+    show.columns = [label, "Criados", "Ganhos", "Perdidos", "Valor ganho", "% Conversão"]
+    return show
+
+
+def render_conversao(df):
+    st.markdown("### Conversão (criados → ganho)")
+    if df.empty:
+        st.info("Sem negócios no filtro atual.")
+        return
+    total = len(df)
+    ganho = int((df["Situação"] == "Ganho").sum())
+    st.metric("Conversão geral", f"{(ganho/total*100) if total else 0:.1f}%", help=f"{ganho}/{total}")
+    m = df.copy()
+    m["_g"] = (m["Situação"] == "Ganho").astype(int)
+    bym = m.groupby("Mês criação").agg(Criados=("ID", "count"), Ganhos=("_g", "sum")).reset_index()
+    bym = bym[bym["Mês criação"] != "NaT"]
+    bym["Conversão %"] = (bym["Ganhos"] / bym["Criados"].replace(0, float("nan")) * 100).round(1)
+    if not bym.empty:
+        figl = px.line(bym, x="Mês criação", y="Conversão %", markers=True)
+        figl.update_traces(line_color=WON_COLOR)
+        figl.update_layout(title="Conversão por mês (%)", height=320, margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(figl, width="stretch")
+    for dim, label in [("Vendedor", "Responsável"), ("Fonte", "Fonte"), ("Campanha", "Campanha")]:
+        if dim in df.columns and df[dim].notna().any():
+            t = conversion_table(df, dim)
+            t = t[t[dim].notna() & t[dim].astype(str).str.strip().ne("")]
+            if not t.empty:
+                st.markdown(f"#### Conversão por {label.lower()}")
+                st.dataframe(_conv_table_display(t, dim, label).head(40),
+                             width="stretch", hide_index=True)
+
+
 # ====================================================================== login
 def render_login():
     col = st.columns([1, 5])
@@ -415,12 +483,12 @@ def render_dashboard(tenant: dict, user: dict):
 
     spa_labels = [f"{s.get('icon', '🧩')} {s['label']}" for s in spas]
     tab_names = (["📈 Visão geral", "📊 Gestão", "🛒 Pipeline", "📇 Leads", "🛍️ Produtos"] + spa_labels +
-                 ["👤 Vendedores", "🌐 Fontes", "🎯 Metas", "📅 Mês a mês", "🗂️ Dados"])
+                 ["👤 Vendedores", "🌐 Fontes", "🔄 Conversão", "🎯 Metas", "📅 Mês a mês", "🗂️ Dados"])
     tabs = st.tabs(tab_names)
     # índices das abas fixas após as SPAs dinâmicas (5 abas iniciais)
     base = 5 + len(spas)
-    tab_vend, tab_font, tab_meta, tab_mom, tab_dados = (tabs[base], tabs[base + 1], tabs[base + 2],
-                                                        tabs[base + 3], tabs[base + 4])
+    tab_vend, tab_font, tab_conv, tab_meta, tab_mom, tab_dados = (
+        tabs[base], tabs[base + 1], tabs[base + 2], tabs[base + 3], tabs[base + 4], tabs[base + 5])
     # estágios do funil de vendas (cat 0 usa DEAL_STAGE; demais usam DEAL_STAGE_<cat>)
     stage_names = status_map.get(f"DEAL_STAGE_{cat_id}") or status_map.get("DEAL_STAGE", {})
     order = list(stage_names.values())
@@ -538,6 +606,8 @@ def render_dashboard(tenant: dict, user: dict):
             }), include_groups=False).reset_index()
             fech = agg["Ganhos"] + agg["Perdidos"]
             agg["Win rate %"] = (agg["Ganhos"] / fech.replace(0, float("nan")) * 100).round(1)
+            agg["Conversão %"] = (agg["Ganhos"] / agg["Negócios"].replace(0, float("nan")) * 100).round(1)
+            agg["Ticket médio"] = (agg["Valor ganho"] / agg["Ganhos"].replace(0, float("nan")))
             agg = agg.sort_values("Valor ganho", ascending=False)
             fig = px.bar(agg, x="Vendedor", y="Valor ganho", text_auto=".2s")
             fig.update_traces(marker_color=WON_COLOR)
@@ -547,6 +617,9 @@ def render_dashboard(tenant: dict, user: dict):
             disp = agg.copy()
             disp["Valor ganho"] = disp["Valor ganho"].map(fmt_brl)
             disp["Pipeline aberto"] = disp["Pipeline aberto"].map(fmt_brl)
+            disp["Ticket médio"] = disp["Ticket médio"].map(lambda v: fmt_brl(v) if pd.notna(v) else "—")
+            disp = disp[["Vendedor", "Negócios", "Ganhos", "Perdidos", "Conversão %", "Win rate %",
+                         "Ticket médio", "Valor ganho", "Pipeline aberto"]]
             st.dataframe(disp, width='stretch', hide_index=True)
 
     # -------- fontes --------
@@ -567,6 +640,15 @@ def render_dashboard(tenant: dict, user: dict):
                 fig2.update_layout(title="Valor ganho por fonte (R$)", height=460,
                                    margin=dict(l=10, r=10, t=50, b=10))
                 cc[1].plotly_chart(fig2, width='stretch')
+            # ganhos em R$ por Estado / Segmento / Campanha (donuts)
+            st.markdown("#### Valor ganho por dimensão (R$)")
+            dd = st.columns(3)
+            for i, dimc in enumerate(["Estado", "SEGMENTO", "Campanha"]):
+                won_donut(dd[i], deals_f, dimc, {"SEGMENTO": "Segmento"}.get(dimc, dimc))
+
+    # -------- conversão --------
+    with tab_conv:
+        render_conversao(deals_f)
 
     # -------- metas --------
     with tab_meta:
@@ -704,6 +786,14 @@ def render_leads_from_deals(df):
     dim_bar(cc2[0], df, "Campanha", "Leads por campanha")
     dim_bar(cc2[1], df[df["Classe"] == "Lead desqualificado"], "MOTIVO",
             "Motivos de desqualificação", LOST_COLOR)
+    # tabela de campanha (criados / ganhos / valor / % conversão)
+    if "Campanha" in df.columns and df["Campanha"].notna().any():
+        t = conversion_table(df, "Campanha")
+        t = t[t["Campanha"].notna() & t["Campanha"].astype(str).str.strip().ne("")]
+        if not t.empty:
+            st.markdown("#### Leads criados por campanha")
+            st.dataframe(_conv_table_display(t, "Campanha", "Campanha").head(40),
+                         width="stretch", hide_index=True)
     bym = df.groupby(["Mês criação", "Classe"]).size().reset_index(name="Qtde")
     bym = bym[bym["Mês criação"] != "NaT"]
     if not bym.empty:
@@ -776,6 +866,16 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
                           color_discrete_map=SAC_COLORS)
             figm.update_layout(title="Status por mês", height=360, margin=dict(l=10, r=10, t=50, b=10))
             st.plotly_chart(figm, width="stretch")
+        # status por dia
+        dd = d.copy()
+        dd["Dia"] = dd["DATE_CREATE"].dt.date
+        byd = dd.dropna(subset=["Dia"]).groupby(["Dia", "Situação"]).size().reset_index(name="Qtde")
+        byd["Situação"] = byd["Situação"].map(SAC_SIT)
+        if not byd.empty:
+            figd = px.bar(byd, x="Dia", y="Qtde", color="Situação", barmode="stack",
+                          color_discrete_map=SAC_COLORS)
+            figd.update_layout(title="Status por dia", height=340, margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(figd, width="stretch")
 
     with tabs[1]:
         cc = st.columns(2)
@@ -801,6 +901,21 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
             g.columns = ["Produto", "Criados", "Resolvidos", "Não Resolvidos", "Resolução %"]
             st.markdown("#### Produtos em chamados")
             st.dataframe(g.head(50), width="stretch", hide_index=True)
+            # quantidade de produtos por tipo de defeito
+            if "Defeitos" in d.columns:
+                defmap = d.set_index("ID")["Defeitos"]
+                pp = p.copy()
+                pp["Defeito"] = pp["DEAL_ID"].map(defmap)
+                pp = pp[pp["Defeito"].notna() & pp["Defeito"].astype(str).str.strip().ne("")]
+                if not pp.empty:
+                    gd = (pp.groupby("Defeito")["QUANTITY"].sum().sort_values(ascending=False)
+                          .head(21).reset_index())
+                    figdef = px.bar(gd.sort_values("QUANTITY"), x="QUANTITY", y="Defeito",
+                                    orientation="h", text_auto=True)
+                    figdef.update_traces(marker_color=LOST_COLOR)
+                    figdef.update_layout(title="Quantidade de produtos por tipo de defeito",
+                                         height=480, margin=dict(l=10, r=10, t=50, b=10))
+                    st.plotly_chart(figdef, width="stretch")
 
     with tabs[3]:
         st.download_button("⬇️ Chamados (CSV)", d.to_csv(index=False).encode("utf-8-sig"),

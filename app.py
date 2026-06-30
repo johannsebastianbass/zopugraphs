@@ -56,7 +56,7 @@ def to_dt(series: pd.Series) -> pd.Series:
     return s.dt.tz_convert("America/Sao_Paulo").dt.tz_localize(None)
 
 
-def build_deals_df(df, status_map, user_map, category_id) -> pd.DataFrame:
+def build_deals_df(df, status_map, user_map, category_id, won_stages=None) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
@@ -83,6 +83,9 @@ def build_deals_df(df, status_map, user_map, category_id) -> pd.DataFrame:
         return "Aberto"
 
     df["Situação"] = df["STAGE_ID"].apply(situacao)
+    # estágios extras tratados como ganho (ex.: TS Shara conta "Excluídos SSA")
+    if won_stages:
+        df.loc[df["Estágio"].isin(won_stages), "Situação"] = "Ganho"
     df["Ciclo (dias)"] = (df["CLOSEDATE"] - df["DATE_CREATE"]).dt.days
     df["Mês criação"] = df["DATE_CREATE"].dt.to_period("M").astype(str)
     df["Mês fechamento"] = df["CLOSEDATE"].dt.to_period("M").astype(str)
@@ -290,7 +293,8 @@ def load_frames(tenant_id: int, cat_id: str, spa_ids: tuple, cache_key: str):
     (tenant, sync) para que filtros e troca de abas fiquem rápidos."""
     meta = db.get_meta(tenant_id)
     sm, um = meta["status_map"], meta["user_map"]
-    deals = build_deals_df(db.deals_df(tenant_id), sm, um, cat_id)
+    won_stages = db.get_field_map(tenant_id).get("won_extra_stages") or []
+    deals = build_deals_df(db.deals_df(tenant_id), sm, um, cat_id, won_stages=won_stages)
     leads = build_leads_df(db.leads_df(tenant_id), sm, um)
     spa = {et: build_spa_df(db.spa_items_df(tenant_id, et), sm, um, et) for et in spa_ids}
     products = build_products_df(db.products_df(tenant_id), deals)
@@ -345,13 +349,15 @@ def render_dashboard(tenant: dict, user: dict):
 
     # ---------------- filtros ----------------
     st.sidebar.header("Filtros")
-    all_dates = pd.concat([
-        deals_all.get("DATE_CREATE", pd.Series(dtype="datetime64[ns]")),
-        leads_all.get("DATE_CREATE", pd.Series(dtype="datetime64[ns]")),
-    ]).dropna()
+    date_base = st.sidebar.radio("Base da data", ["Criação", "Fechamento"], horizontal=True,
+                                 help="Filtrar o período pela data de criação ou de fechamento do negócio")
+    date_col = "CLOSEDATE" if date_base == "Fechamento" else "DATE_CREATE"
+    base_dates = deals_all.get(date_col, pd.Series(dtype="datetime64[ns]"))
+    all_dates = pd.concat([base_dates,
+                           leads_all.get("DATE_CREATE", pd.Series(dtype="datetime64[ns]"))]).dropna()
     if not all_dates.empty:
         dmin, dmax = all_dates.min().date(), all_dates.max().date()
-        rng = st.sidebar.date_input("Período (criação)", value=(dmin, dmax),
+        rng = st.sidebar.date_input(f"Período ({date_base.lower()})", value=(dmin, dmax),
                                     min_value=dmin, max_value=dmax)
         d0, d1 = rng if isinstance(rng, tuple) and len(rng) == 2 else (dmin, dmax)
     else:
@@ -388,13 +394,17 @@ def render_dashboard(tenant: dict, user: dict):
             val_range = st.slider("Valor (R$)", 0.0, vmax, (0.0, vmax))
 
     def flt(df, use_date=True):
-        """Filtros comuns (data, vendedor, fonte) — seguros para qualquer entidade."""
+        """Filtros comuns (data, vendedor, fonte) — seguros para qualquer entidade.
+        A data usa a base escolhida (criação/fechamento); entidades sem CLOSEDATE
+        caem para DATE_CREATE."""
         if df.empty:
             return df
         m = pd.Series(True, index=df.index)
-        if use_date and d0 is not None and "DATE_CREATE" in df.columns:
-            ds = df["DATE_CREATE"].dt.date
-            m &= (ds >= d0) & (ds <= d1)
+        if use_date and d0 is not None:
+            col = date_col if date_col in df.columns else "DATE_CREATE"
+            if col in df.columns:
+                ds = df[col].dt.date
+                m &= (ds >= d0) & (ds <= d1)
         if sel_vend and "Vendedor" in df.columns:
             m &= df["Vendedor"].isin(sel_vend)
         if sel_fonte and "Fonte" in df.columns:
@@ -458,7 +468,8 @@ def render_dashboard(tenant: dict, user: dict):
         neg_perd = int(vc.get("Negócio perdido", 0))
         qualificados = neg_ganho + neg_perd + int(vc.get("Negócio aberto", 0))
         total_leads = len(deals_f)
-        taxa_conv = (qualificados / total_leads * 100) if total_leads else 0
+        taxa_conv = (qualificados / total_leads * 100) if total_leads else 0   # lead -> negócio
+        taxa_geral = (neg_ganho / total_leads * 100) if total_leads else 0     # lead -> ganho
         win_rate = (neg_ganho / (neg_ganho + neg_perd) * 100) if (neg_ganho + neg_perd) else 0
         valor_aberto = deals_f.loc[deals_f["Classe"] == "Negócio aberto", "OPPORTUNITY"].sum()
 
@@ -472,8 +483,9 @@ def render_dashboard(tenant: dict, user: dict):
     r2 = st.columns(4)
     if leads_in_deals:
         r2[0].metric("📇 Leads gerados", fmt_int(total_leads))
-        r2[1].metric("✅ Conversão lead→negócio", f"{taxa_conv:.1f}%",
-                     help="Negócios qualificados / leads gerados")
+        r2[1].metric("✅ Taxa geral de conversão", f"{taxa_geral:.1f}%",
+                     delta=f"{taxa_conv:.1f}% viram negócio", delta_color="off",
+                     help="Negócios ganhos / leads gerados (lead → ganho)")
     else:
         r2[0].metric("📇 Leads", fmt_int(total_leads))
         r2[1].metric("✅ Conversão de leads", f"{taxa_conv:.1f}%", help=f"{conv_leads}/{total_leads}")
@@ -754,8 +766,8 @@ CLASSE_COLORS = {"Lead": "#f59e0b", "Lead desqualificado": "#9ca3af",
 def render_leads_from_deals(df):
     st.markdown("### Leads (originados nos negócios)")
     st.caption("Neste CRM o lead é o negócio nas fases iniciais (Nova Oportunidade → "
-               "Entrando em Contato → Diagnóstico). Depois disso vira negócio. "
-               "A tabela de Leads do Bitrix não é usada.")
+               "Entrando em Contato). A partir de Diagnóstico vira lead qualificado / "
+               "negócio (tag RD Station). A tabela de Leads do Bitrix não é usada.")
     if df.empty or "Classe" not in df.columns:
         st.info("Sem negócios no filtro atual.")
         return

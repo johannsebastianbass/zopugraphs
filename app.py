@@ -1087,6 +1087,7 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
     if d.empty:
         st.info("Sem chamados de assistência técnica sincronizados.")
         return
+    st.sidebar.header("Filtros SAC")
     dts = d["DATE_CREATE"].dropna()
     if not dts.empty:
         dmin, dmax = dts.min().date(), dts.max().date()
@@ -1095,6 +1096,32 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
         if isinstance(rng, tuple) and len(rng) == 2:
             ds = d["DATE_CREATE"].dt.date
             d = d[(ds >= rng[0]) & (ds <= rng[1])]
+    # situação
+    sit_opts = [s for s in ["Em andamento", "Resolvido", "Não resolvido"]
+                if s in set(d["Situação"].map(SAC_SIT))]
+    sel_sit = st.sidebar.multiselect("Situação", sit_opts, default=sit_opts) if sit_opts else None
+    if sel_sit is not None and set(sel_sit) != set(sit_opts):
+        d = d[d["Situação"].map(SAC_SIT).isin(sel_sit)]
+    # dimensões do chamado
+    with st.sidebar.expander("Mais filtros SAC"):
+        for col in ["Tipo de Interação", "Modo de Falha", "Defeitos", "Resolução"]:
+            if col in d.columns and d[col].notna().any():
+                opts = sorted(d[col].dropna().astype(str).unique().tolist())
+                sel = st.multiselect(col, opts, default=opts, key=f"sac_{col}")
+                if set(sel) != set(opts):
+                    d = d[d[col].astype(str).isin(sel)]
+    # família de produto (via produtos dos chamados)
+    sac_all_prod = (prod_all[prod_all["DEAL_ID"].isin(
+        set(deals_all[deals_all["CATEGORY_ID"] == cat]["ID"].astype(str)))]
+        if not prod_all.empty and "Família" in prod_all.columns else prod_all)
+    if not sac_all_prod.empty and "Família" in sac_all_prod.columns:
+        fam_opts = sorted(sac_all_prod["Família"].dropna().astype(str).unique().tolist())
+        if fam_opts:
+            sel_fam = st.sidebar.multiselect("Família de produto", fam_opts, default=fam_opts)
+            if set(sel_fam) != set(fam_opts):
+                fam_ids = set(sac_all_prod.loc[sac_all_prod["Família"].astype(str).isin(sel_fam),
+                                               "DEAL_ID"].astype(str))
+                d = d[d["ID"].astype(str).isin(fam_ids)]
     st.caption(f"{len(d)} chamados · pipeline Assistência Técnica")
 
     total = len(d)
@@ -1129,7 +1156,7 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
                      color_discrete_map=SAC_COLORS)
         fig.update_layout(title="Resolução", height=380, margin=dict(l=10, r=10, t=50, b=10))
         cc[0].plotly_chart(fig, width="stretch")
-        dim_bar(cc[1], d, "Estágio", "Chamados por estágio")
+        count_donut(cc[1], d, "Estágio", "Chamados por estágio", top=10)
         bym = d.groupby(["Mês criação", "Situação"]).size().reset_index(name="Qtde")
         bym = bym[bym["Mês criação"] != "NaT"]
         bym["Situação"] = bym["Situação"].map(SAC_SIT)
@@ -1151,12 +1178,13 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
 
     with tabs[1]:
         cc = st.columns(2)
-        dim_bar(cc[0], d, "Tipo de Interação", "Tipo de interação")
-        dim_bar(cc[1], d, "Modo de Falha", "Modo de falha de reclamação")
+        count_donut(cc[0], d, "Tipo de Interação", "Tipo de interação")
+        count_donut(cc[1], d, "Modo de Falha", "Modo de falha de reclamação")
         cc2 = st.columns(2)
-        dim_bar(cc2[0], d, "Defeitos", "Defeitos", top=21)
-        dim_bar(cc2[1], d, "Sugestão", "Sugestão")
-        dim_bar(st, d, "Resolução", "Resolução", top=12)
+        count_donut(cc2[0], d, "Sugestão", "Sugestão")
+        count_donut(cc2[1], d, "Resolução", "Resolução", top=9)
+        # Defeitos tem muitas categorias (21) -> barra é mais legível
+        dim_bar(st, d, "Defeitos", "Defeitos por chamado", top=21)
 
     with tabs[2]:
         ids = set(d["ID"])
@@ -1196,7 +1224,19 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
                     Resolvidos=("Situação", lambda s: int((s == "Ganho").sum())),
                     Qtd=("QUANTITY", "sum")).reset_index())
                 gf["Resolução %"] = (gf["Resolvidos"] / gf["Criados"] * 100).round(1)
-                st.dataframe(gf.sort_values("Criados", ascending=False), width="stretch", hide_index=True)
+                gf = gf.sort_values("Criados", ascending=False)
+                cfam = st.columns(2)
+                gd2 = gf[gf["Família"].astype(str).ne("N/A")]
+                if not gd2.empty:
+                    figfam = px.pie(gd2, names="Família", values="Qtd", hole=0.5)
+                    figfam.update_layout(title="Produtos por família (qtd)", height=380,
+                                         margin=dict(l=10, r=10, t=50, b=10))
+                    cfam[0].plotly_chart(figfam, width="stretch")
+                    figfr = px.pie(gd2, names="Família", values="Criados", hole=0.5)
+                    figfr.update_layout(title="Chamados por família", height=380,
+                                        margin=dict(l=10, r=10, t=50, b=10))
+                    cfam[1].plotly_chart(figfr, width="stretch")
+                st.dataframe(gf, width="stretch", hide_index=True)
                 # gráfico de pilha: família × modo de falha
                 if "Modo de Falha" in d.columns:
                     fmap2 = d.set_index("ID")["Modo de Falha"]

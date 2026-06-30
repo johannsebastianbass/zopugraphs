@@ -564,6 +564,36 @@ def render_dashboard(tenant: dict, user: dict):
         dim_bar(cc2[1], deals_f, "SEGMENTO", "Negócios por segmento")
         render_extra_dims(deals_f)
 
+        # forecast: negócios em aberto por data de fechamento prevista (CLOSEDATE planejado)
+        st.markdown("#### Negócios em aberto por data de fechamento prevista")
+        op = opend.dropna(subset=["CLOSEDATE"]).copy()
+        if not op.empty:
+            op["Mês prev."] = op["CLOSEDATE"].dt.to_period("M").astype(str)
+            fc = (op.groupby("Mês prev.").agg(Negócios=("ID", "count"),
+                  Valor=("OPPORTUNITY", "sum")).reset_index().sort_values("Mês prev."))
+            fc = fc[fc["Mês prev."] != "NaT"]
+            figf = go.Figure()
+            figf.add_bar(x=fc["Mês prev."], y=fc["Negócios"], name="Negócios", marker_color=OPEN_COLOR)
+            figf.add_trace(go.Scatter(x=fc["Mês prev."], y=fc["Valor"], name="Valor (R$)",
+                                      yaxis="y2", mode="lines+markers", line=dict(color=WON_COLOR)))
+            figf.update_layout(title="Previsão de fechamento (nº e R$)", height=380,
+                               yaxis=dict(title="Negócios"),
+                               yaxis2=dict(title="R$", overlaying="y", side="right", showgrid=False),
+                               margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(figf, width="stretch")
+
+        # motivos de perda por vendedor (pivot)
+        if not lost.empty and "MOTIVO" in lost.columns:
+            lp = lost[lost["MOTIVO"].notna() & lost["MOTIVO"].astype(str).str.strip().ne("")]
+            if not lp.empty:
+                st.markdown("#### Motivos de perda por vendedor")
+                piv = pd.crosstab(lp["MOTIVO"], lp["Vendedor"])
+                top_v = piv.sum(axis=0).sort_values(ascending=False).head(12).index
+                piv = piv[top_v]
+                piv["Total"] = piv.sum(axis=1)
+                piv = piv.sort_values("Total", ascending=False)
+                st.dataframe(piv, width="stretch")
+
     # -------- leads --------
     with tabs[3]:
       if leads_in_deals:
@@ -1360,6 +1390,20 @@ def render_mom(deals_t, leads_t):
     show["Conversão %"] = monthly["Conversão %"].map(lambda x: f"{x:.1f}%")
     st.dataframe(show.reset_index().rename(columns={"index": "Mês"}),
                  width='stretch', hide_index=True)
+
+    # Receita anual (ano a ano) — uma linha por ano, eixo = mês
+    st.markdown("#### Receita anual (ano a ano)")
+    w = won.dropna(subset=["Fechamento"]).copy()
+    if not w.empty:
+        w["Ano"] = w["Fechamento"].dt.year.astype(int)
+        w["MesNum"] = w["Fechamento"].dt.month.astype(int)
+        yoy = w.groupby(["Ano", "MesNum"])["OPPORTUNITY"].sum().reset_index()
+        yoy["Mês"] = yoy["MesNum"].map(lambda m: MESES_PT[m])
+        figy = px.line(yoy.sort_values("MesNum"), x="Mês", y="OPPORTUNITY", color="Ano",
+                       markers=True, category_orders={"Mês": MESES_PT[1:]})
+        figy.update_layout(title="Receita ganha por mês, por ano (R$)", height=380,
+                           yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(figy, width="stretch")
 
 
 # ====================================================================== admin

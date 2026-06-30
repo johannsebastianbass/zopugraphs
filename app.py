@@ -263,8 +263,10 @@ def render_dashboard(tenant: dict, user: dict):
         deals_all = deals_all[deals_all["CATEGORY_ID"].astype(str) == str(cat_id)]
 
     st.title(f"📊 {tenant['NAME']}")
-    info = (f"Funil: **{cat_name}** · {len(deals_all)} negócios · {len(leads_all)} leads"
-            f" · {n_spa} itens SPA")
+    info = f"Funil: **{cat_name}** · {len(deals_all)} negócios"
+    if not fmap.get("leads_from_deals"):
+        info += f" · {len(leads_all)} leads"
+    info += f" · {n_spa} itens SPA"
     if sync and sync.get("LAST_RUN"):
         info += f" · última sync: {sync['LAST_RUN'].replace('T', ' ')}"
     st.caption(info)
@@ -371,15 +373,42 @@ def render_dashboard(tenant: dict, user: dict):
     conv_leads = int(leads_f["Convertido"].sum()) if total_leads else 0
     taxa_conv = (conv_leads / total_leads * 100) if total_leads else 0
 
+    # CRMs onde o lead é o negócio nas fases iniciais (ex.: TS Shara) — recalcula
+    lfd = fmap.get("leads_from_deals")
+    leads_in_deals = bool(lfd) and not deals_f.empty
+    if leads_in_deals:
+        deals_f = deals_f.copy()
+        deals_f["Classe"] = classify_funnel(deals_f, lfd.get("lead_stages", []))
+        # alinha o Status do Cartão (usado na aba Pipeline) com a nova fronteira
+        deals_f["Status do Cartão"] = deals_f["Classe"].map({
+            "Lead": "Lead", "Lead desqualificado": "Lead Desqualificado",
+            "Negócio aberto": "Negócio (Lead Qualificado)",
+            "Negócio perdido": "Negócio (Lead Qualificado)",
+            "Negócio ganho": "Negócio Ganho"})
+        vc = deals_f["Classe"].value_counts()
+        neg_ganho = int(vc.get("Negócio ganho", 0))
+        neg_perd = int(vc.get("Negócio perdido", 0))
+        qualificados = neg_ganho + neg_perd + int(vc.get("Negócio aberto", 0))
+        total_leads = len(deals_f)
+        taxa_conv = (qualificados / total_leads * 100) if total_leads else 0
+        win_rate = (neg_ganho / (neg_ganho + neg_perd) * 100) if (neg_ganho + neg_perd) else 0
+        valor_aberto = deals_f.loc[deals_f["Classe"] == "Negócio aberto", "OPPORTUNITY"].sum()
+
     st.subheader("Indicadores-chave")
     r1 = st.columns(4)
     r1[0].metric("💰 Valor ganho", fmt_brl(valor_ganho))
     r1[1].metric("🟦 Pipeline aberto", fmt_brl(valor_aberto))
-    r1[2].metric("🎯 Win rate", f"{win_rate:.1f}%")
+    r1[2].metric("🎯 Win rate", f"{win_rate:.1f}%",
+                 help="Ganhos / (ganhos + negócios perdidos)" if leads_in_deals else None)
     r1[3].metric("🧾 Ticket médio", fmt_brl(ticket))
     r2 = st.columns(4)
-    r2[0].metric("📇 Leads", fmt_int(total_leads))
-    r2[1].metric("✅ Conversão de leads", f"{taxa_conv:.1f}%", help=f"{conv_leads}/{total_leads}")
+    if leads_in_deals:
+        r2[0].metric("📇 Leads gerados", fmt_int(total_leads))
+        r2[1].metric("✅ Conversão lead→negócio", f"{taxa_conv:.1f}%",
+                     help="Negócios qualificados / leads gerados")
+    else:
+        r2[0].metric("📇 Leads", fmt_int(total_leads))
+        r2[1].metric("✅ Conversão de leads", f"{taxa_conv:.1f}%", help=f"{conv_leads}/{total_leads}")
     r2[2].metric("🤝 Negócios ganhos", fmt_int(len(won)))
     r2[3].metric("⏱️ Ciclo (mediana)", f"{ciclo:.0f} dias" if ciclo else "—")
     st.divider()
@@ -450,6 +479,9 @@ def render_dashboard(tenant: dict, user: dict):
 
     # -------- leads --------
     with tabs[3]:
+      if leads_in_deals:
+        render_leads_from_deals(deals_f)
+      else:
         c = st.columns(4)
         junk = int(leads_f["Desqualificado"].sum()) if total_leads else 0
         noshow = int((leads_f["Status"] == "No-show/Cancelada/Regendamento").sum()) if total_leads else 0
@@ -606,6 +638,80 @@ def render_extra_dims(deals_f):
     cc = st.columns(2)
     for i, dim in enumerate(cat):
         dim_bar(cc[i % 2], deals_f, dim, dim)
+
+
+def classify_funnel(df, lead_stages):
+    """Para CRMs que tratam lead como fases iniciais do negócio: classifica cada
+    negócio em Lead / Lead desqualificado / Negócio aberto / Negócio perdido /
+    Negócio ganho. Usa o Status do Cartão já calculado na sync (que considera
+    qualificação + fase anterior) e aplica a fronteira de fases de lead: um
+    negócio EM ABERTO numa fase de lead volta a contar como Lead."""
+    lead_set = set(lead_stages)
+    status = (df["Status do Cartão"].astype(str) if "Status do Cartão" in df.columns
+              else pd.Series(["Lead"] * len(df), index=df.index))
+    out = []
+    for stt, situ, stage in zip(status, df["Situação"], df["Estágio"]):
+        if situ == "Aberto" and stage in lead_set:
+            out.append("Lead")
+        elif stt == "Negócio Ganho":
+            out.append("Negócio ganho")
+        elif stt == "Lead Desqualificado":
+            out.append("Lead desqualificado")
+        elif stt == "Lead":
+            out.append("Lead")
+        else:  # Negócio (Lead Qualificado)
+            out.append("Negócio perdido" if situ == "Perdido" else "Negócio aberto")
+    return out
+
+
+CLASSE_COLORS = {"Lead": "#f59e0b", "Lead desqualificado": "#9ca3af",
+                 "Negócio aberto": OPEN_COLOR, "Negócio perdido": LOST_COLOR,
+                 "Negócio ganho": WON_COLOR}
+
+
+def render_leads_from_deals(df):
+    st.markdown("### Leads (originados nos negócios)")
+    st.caption("Neste CRM o lead é o negócio nas fases iniciais (Nova Oportunidade → "
+               "Entrando em Contato → Diagnóstico). Depois disso vira negócio. "
+               "A tabela de Leads do Bitrix não é usada.")
+    if df.empty or "Classe" not in df.columns:
+        st.info("Sem negócios no filtro atual.")
+        return
+    total = len(df)
+    vc = df["Classe"].value_counts()
+    qual = int(vc.get("Negócio aberto", 0) + vc.get("Negócio perdido", 0) + vc.get("Negócio ganho", 0))
+    desq = int(vc.get("Lead desqualificado", 0))
+    leadab = int(vc.get("Lead", 0))
+    ganho = int(vc.get("Negócio ganho", 0))
+    k = st.columns(4)
+    k[0].metric("Leads gerados", fmt_int(total))
+    k[1].metric("Viraram negócio", fmt_int(qual), f"{(qual/total*100) if total else 0:.1f}%")
+    k[2].metric("Desqualificados", fmt_int(desq), f"{(desq/total*100) if total else 0:.1f}%")
+    k[3].metric("Ainda em lead (aberto)", fmt_int(leadab))
+
+    fdf = pd.DataFrame({"Etapa": ["Leads gerados", "Viraram negócio", "Ganhos"],
+                        "Qtde": [total, qual, ganho]})
+    fig = go.Figure(go.Funnel(y=fdf["Etapa"], x=fdf["Qtde"], textinfo="value+percent initial",
+                              marker={"color": [OPEN_COLOR, "#6366f1", WON_COLOR]}))
+    fig.update_layout(title="Funil Lead → Negócio → Ganho", height=340,
+                      margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, width="stretch")
+
+    cc = st.columns(2)
+    dim_bar(cc[0], df, "Canal", "Leads por canal")
+    dim_bar(cc[1], df, "Fonte/Origem", "Leads por fonte/origem")
+    cc2 = st.columns(2)
+    dim_bar(cc2[0], df, "Campanha", "Leads por campanha")
+    dim_bar(cc2[1], df[df["Classe"] == "Lead desqualificado"], "MOTIVO",
+            "Motivos de desqualificação", LOST_COLOR)
+    bym = df.groupby(["Mês criação", "Classe"]).size().reset_index(name="Qtde")
+    bym = bym[bym["Mês criação"] != "NaT"]
+    if not bym.empty:
+        figm = px.bar(bym, x="Mês criação", y="Qtde", color="Classe", barmode="stack",
+                      color_discrete_map=CLASSE_COLORS)
+        figm.update_layout(title="Leads/negócios criados por mês", height=360,
+                           margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(figm, width="stretch")
 
 
 SAC_SIT = {"Aberto": "Em andamento", "Ganho": "Resolvido", "Perdido": "Não resolvido"}

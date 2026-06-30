@@ -86,9 +86,14 @@ def build_deals_df(df, status_map, user_map, category_id, won_stages=None) -> pd
     # estágios extras tratados como ganho (ex.: TS Shara conta "Excluídos SSA")
     if won_stages:
         df.loc[df["Estágio"].isin(won_stages), "Situação"] = "Ganho"
-    df["Ciclo (dias)"] = (df["CLOSEDATE"] - df["DATE_CREATE"]).dt.days
+    # data de finalização real = última modificação dos negócios fechados
+    # (o CLOSEDATE do Bitrix costuma ser uma data PREVISTA, às vezes anterior à criação)
+    df["DATE_MODIFY"] = to_dt(df.get("DATE_MODIFY"))
+    closed = df["Situação"].isin(["Ganho", "Perdido"])
+    df["Fechamento"] = df["DATE_MODIFY"].where(closed)
+    df["Ciclo (dias)"] = (df["Fechamento"] - df["DATE_CREATE"]).dt.days.clip(lower=0)
     df["Mês criação"] = df["DATE_CREATE"].dt.to_period("M").astype(str)
-    df["Mês fechamento"] = df["CLOSEDATE"].dt.to_period("M").astype(str)
+    df["Mês fechamento"] = df["Fechamento"].dt.to_period("M").astype(str)
     # dimensões extras (JSON em EXTRA) viram colunas: Canal, Campanha, Status do Cartão...
     if "EXTRA" in df.columns:
         parsed = df["EXTRA"].apply(lambda s: json.loads(s) if isinstance(s, str) and s else {})
@@ -350,8 +355,8 @@ def render_dashboard(tenant: dict, user: dict):
     # ---------------- filtros ----------------
     st.sidebar.header("Filtros")
     date_base = st.sidebar.radio("Base da data", ["Criação", "Fechamento"], horizontal=True,
-                                 help="Filtrar o período pela data de criação ou de fechamento do negócio")
-    date_col = "CLOSEDATE" if date_base == "Fechamento" else "DATE_CREATE"
+                                 help="Período pela data de criação ou de finalização (fechamento real) do negócio")
+    date_col = "Fechamento" if date_base == "Fechamento" else "DATE_CREATE"
     base_dates = deals_all.get(date_col, pd.Series(dtype="datetime64[ns]"))
     all_dates = pd.concat([base_dates,
                            leads_all.get("DATE_CREATE", pd.Series(dtype="datetime64[ns]"))]).dropna()
@@ -520,7 +525,7 @@ def render_dashboard(tenant: dict, user: dict):
 
     # -------- gestão --------
     with tabs[1]:
-        render_gestao(deals_t, leads_t)
+        render_gestao(deals_t, leads_t, lfd if leads_in_deals else None)
 
     # -------- pipeline --------
     with tabs[2]:
@@ -1059,37 +1064,63 @@ def _period(series: pd.Series, gran: str) -> pd.Series:
     return series.dt.to_period(code).astype(str)
 
 
-def render_gestao(deals_t, leads_t):
+def render_gestao(deals_t, leads_t, lfd=None):
     st.markdown("### Indicadores de gestão")
     st.caption("Visão de alto nível: geração de demanda e saúde do funil. "
                "Respeita os filtros de vendedor/fonte/período da barra lateral.")
     won = deals_t[deals_t["Situação"] == "Ganho"]
-    tot_leads = len(leads_t)
-    conv = int(leads_t["Convertido"].sum()) if tot_leads else 0
     receita = won["OPPORTUNITY"].sum()
-    ticket = won["OPPORTUNITY"].mean() if len(won) else 0
+    # neste CRM (leads_from_deals) o lead é o próprio negócio
+    if lfd is not None and not deals_t.empty:
+        dd = deals_t.copy()
+        dd["Classe"] = classify_funnel(dd, lfd.get("lead_stages", []))
+        lead_src = dd
+        tot_leads = len(dd)
+        neg_mask = dd["Classe"].isin(["Negócio aberto", "Negócio perdido", "Negócio ganho"])
+        neg_count = int(neg_mask.sum())
+        neg_df = dd[neg_mask]
+    else:
+        lead_src = leads_t
+        tot_leads = len(leads_t)
+        neg_count = len(deals_t)
+        neg_df = deals_t
     k = st.columns(5)
     k[0].metric("Leads gerados", fmt_int(tot_leads))
-    k[1].metric("Conversão de leads", f"{(conv/tot_leads*100) if tot_leads else 0:.1f}%")
-    k[2].metric("Negócios criados", fmt_int(len(deals_t)))
-    k[3].metric("Ganhos (novos clientes)", fmt_int(len(won)))
+    k[1].metric("Conversão (lead→ganho)", f"{(len(won)/tot_leads*100) if tot_leads else 0:.1f}%")
+    k[2].metric("Viraram negócio", fmt_int(neg_count))
+    k[3].metric("Ganhos", fmt_int(len(won)))
     k[4].metric("Receita ganha", fmt_brl(receita))
 
     st.markdown("#### Geração de demanda")
     gran = st.radio("Granularidade", ["Dia", "Semana", "Mês", "Trimestre", "Ano"],
                     index=2, horizontal=True, key="gran_gestao")
-    lead_s = leads_t.assign(p=_period(leads_t["DATE_CREATE"], gran)).groupby("p").size().rename("Leads")
-    deal_s = deals_t.assign(p=_period(deals_t["DATE_CREATE"], gran)).groupby("p").size().rename("Negócios")
+    lead_s = lead_src.assign(p=_period(lead_src["DATE_CREATE"], gran)).groupby("p").size().rename("Leads")
+    deal_s = neg_df.assign(p=_period(neg_df["DATE_CREATE"], gran)).groupby("p").size().rename("Negócios")
     won_s = won.assign(p=_period(won["DATE_CREATE"], gran)).groupby("p").size().rename("Ganhos")
     dem = pd.concat([lead_s, deal_s, won_s], axis=1).fillna(0).reset_index().rename(columns={"p": "Período"})
     dem = dem[dem["Período"] != "NaT"].sort_values("Período")
     if not dem.empty:
-        m = dem.melt(id_vars="Período", var_name="Tipo", value_name="Qtde")
-        fig = px.bar(m, x="Período", y="Qtde", color="Tipo", barmode="group",
-                     color_discrete_map={"Leads": META_COLOR, "Negócios": OPEN_COLOR, "Ganhos": WON_COLOR})
-        fig.update_layout(title=f"Leads, negócios e ganhos por {gran.lower()}", height=420,
-                          margin=dict(l=10, r=10, t=50, b=10))
+        dem["% vira negócio"] = (dem["Negócios"] / dem["Leads"].replace(0, float("nan")) * 100).round(1)
+        dem["% Conversão"] = (dem["Ganhos"] / dem["Leads"].replace(0, float("nan")) * 100).round(1)
+        fig = go.Figure()
+        for tipo, cor in [("Leads", META_COLOR), ("Negócios", OPEN_COLOR), ("Ganhos", WON_COLOR)]:
+            fig.add_bar(x=dem["Período"], y=dem[tipo], name=tipo, marker_color=cor)
+        fig.add_trace(go.Scatter(x=dem["Período"], y=dem["% Conversão"], name="% Conversão",
+                                 yaxis="y2", mode="lines+markers+text",
+                                 text=dem["% Conversão"].map(lambda v: f"{v:.0f}%" if pd.notna(v) else ""),
+                                 textposition="top center", line=dict(color="#dc2626")))
+        ymax = dem["% Conversão"].max()
+        fig.update_layout(title=f"Leads, negócios e ganhos por {gran.lower()}", height=440,
+                          barmode="group", margin=dict(l=10, r=10, t=50, b=10),
+                          yaxis2=dict(title="% Conversão", overlaying="y", side="right",
+                                      showgrid=False, range=[0, max(1, (ymax or 0) * 1.4)]))
         st.plotly_chart(fig, width="stretch")
+        show = dem.copy()
+        for c in ["Leads", "Negócios", "Ganhos"]:
+            show[c] = show[c].astype(int)
+        show["% vira negócio"] = show["% vira negócio"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+        show["% Conversão"] = show["% Conversão"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+        st.dataframe(show, width="stretch", hide_index=True)
 
     st.markdown("#### Geração de leads por origem e conversão para ganho")
     lg = leads_t.groupby("Fonte").agg(Leads=("ID", "count"), Conv=("Convertido", "sum")).reset_index()

@@ -577,16 +577,31 @@ def render_extra_dims(deals_f):
     num_dims = [c for c in deals_f.columns if c.startswith("Tempo")]
     if deals_f.empty or not (present or num_dims):
         return
-    st.markdown("#### Status do cartão e canais")
+    st.markdown("#### Status do cartão e conversão")
     if "Status do Cartão" in deals_f.columns:
         sc = deals_f["Status do Cartão"].value_counts()
         cols = st.columns(len(CARD_ORDER))
         for i, k in enumerate(CARD_ORDER):
             cols[i].metric(k, fmt_int(sc.get(k, 0)))
+        # conversão (conceito de funil de growth: Lead -> Qualificado -> Ganho)
+        total = int(sc.sum())
+        ganho = int(sc.get("Negócio Ganho", 0))
+        qualif = int(sc.get("Negócio (Lead Qualificado)", 0)) + ganho
+        taxa_qual = (qualif / total * 100) if total else 0
+        taxa_ganho_qual = (ganho / qualif * 100) if qualif else 0
+        cc0 = st.columns(3)
+        cc0[0].metric("Taxa de qualificação", f"{taxa_qual:.1f}%",
+                      help="(Negócios qualificados + ganhos) / total de cartões")
+        cc0[1].metric("Conversão p/ ganho (qualificados)", f"{taxa_ganho_qual:.1f}%",
+                      help="Ganhos / negócios qualificados — win rate sobre quem virou negócio real")
+        cc0[2].metric("Conversão geral (cartão→ganho)", f"{(ganho/total*100) if total else 0:.1f}%")
     for nd in num_dims:
-        s = pd.to_numeric(deals_f[nd], errors="coerce").dropna()
+        # ignora valores negativos/zerados (campo de tempo do CRM tem dados inconsistentes)
+        s = pd.to_numeric(deals_f[nd], errors="coerce")
+        s = s[s > 0].dropna()
         if len(s):
-            st.metric(nd, f"{s.mean():.1f}")
+            st.metric(f"{nd} (mediana, válidos)", f"{s.median():.0f}",
+                      help=f"{len(s)} registros com valor positivo")
     cat = [c for c in present if c != "Status do Cartão"]
     cc = st.columns(2)
     for i, dim in enumerate(cat):
@@ -620,7 +635,11 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
     andamento = int((d["Situação"] == "Aberto").sum())
     pct = (resolvido / (resolvido + naores) * 100) if (resolvido + naores) else 0
     tempo_col = next((c for c in d.columns if c.startswith("Tempo")), None)
-    tempo = pd.to_numeric(d[tempo_col], errors="coerce").dropna().mean() if tempo_col else None
+    tempo = None
+    if tempo_col:
+        ts = pd.to_numeric(d[tempo_col], errors="coerce")
+        ts = ts[ts > 0].dropna()  # ignora valores inconsistentes (negativos/zero)
+        tempo = ts.median() if len(ts) else None
 
     r = st.columns(4)
     r[0].metric("📋 Criados", fmt_int(total))
@@ -629,7 +648,7 @@ def render_sac(deals_all, prod_all, status_map, sac_cfg, tenant):
     r[3].metric("❌ Não resolvidos", fmt_int(naores))
     r2 = st.columns(4)
     r2[0].metric("🎯 % Resolução", f"{pct:.1f}%")
-    r2[1].metric("⏱️ Tempo médio (min)", f"{tempo:.1f}" if tempo is not None and tempo == tempo else "—")
+    r2[1].metric("⏱️ Tempo mediano (min)", f"{tempo:.0f}" if tempo is not None else "—")
     st.divider()
 
     tabs = st.tabs(["📊 Visão geral", "🔧 Defeitos & interação", "🛍️ Produtos", "🗂️ Dados"])

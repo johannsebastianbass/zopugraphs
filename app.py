@@ -191,6 +191,26 @@ def won_donut(container, df, col, title, top=10):
     container.plotly_chart(fig, width="stretch")
 
 
+def count_donut(container, df, col, title, top=8):
+    """Donut por contagem de uma dimensão."""
+    if df.empty or col not in df.columns:
+        container.caption(f"{title}: sem dados.")
+        return
+    s = df[col].dropna()
+    s = s[s.astype(str).str.strip().ne("") & s.astype(str).str.strip().ne("—")]
+    if s.empty:
+        container.caption(f"{title}: sem dados.")
+        return
+    g = s.value_counts()
+    if len(g) > top:
+        g = pd.concat([g.iloc[:top], pd.Series({"Outros": g.iloc[top:].sum()})])
+    gg = g.reset_index()
+    gg.columns = [col, "Qtde"]
+    fig = px.pie(gg, names=col, values="Qtde", hole=0.5)
+    fig.update_layout(title=title, height=340, margin=dict(l=10, r=10, t=50, b=10))
+    container.plotly_chart(fig, width="stretch")
+
+
 def conversion_table(df, dim):
     """Tabela de conversão por dimensão: Criados, Ganhos, Perdidos, Valor ganho, Conversão %."""
     b = df.copy()
@@ -237,6 +257,189 @@ def render_conversao(df):
                 st.markdown(f"#### Conversão por {label.lower()}")
                 st.dataframe(_conv_table_display(t, dim, label).head(40),
                              width="stretch", hide_index=True)
+
+
+def _vendor_table(d):
+    agg = d.groupby("Vendedor").apply(lambda g: pd.Series({
+        "Criados": len(g),
+        "Ganhos": int((g["Situação"] == "Ganho").sum()),
+        "Perdidos": int((g["Situação"] == "Perdido").sum()),
+        "Valor": g.loc[g["Situação"] == "Ganho", "OPPORTUNITY"].sum(),
+    }), include_groups=False).reset_index()
+    agg["Conversão %"] = (agg["Ganhos"] / agg["Criados"].replace(0, float("nan")) * 100).round(1)
+    agg["Ticket Méd."] = (agg["Valor"] / agg["Ganhos"].replace(0, float("nan")))
+    agg = agg.sort_values("Valor", ascending=False)
+    disp = agg.copy()
+    disp["Valor"] = disp["Valor"].map(fmt_brl)
+    disp["Ticket Méd."] = disp["Ticket Méd."].map(lambda v: fmt_brl(v) if pd.notna(v) else "—")
+    disp["Conversão %"] = disp["Conversão %"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+    return disp
+
+
+def _val_table(d, dim, situ=None):
+    b = d if situ is None else d[d["Situação"] == situ]
+    g = b.groupby(dim)["OPPORTUNITY"].agg(["count", "sum"]).reset_index()
+    g.columns = [dim, "Qtde", "Valor"]
+    g = g[g[dim].notna() & g[dim].astype(str).str.strip().ne("")].sort_values("Valor", ascending=False)
+    g["Valor"] = g["Valor"].map(fmt_brl)
+    return g
+
+
+def _yoy_revenue(won):
+    w = won.dropna(subset=["Fechamento"]).copy()
+    if w.empty:
+        return None
+    w["Ano"] = w["Fechamento"].dt.year.astype(int)
+    w["MesNum"] = w["Fechamento"].dt.month.astype(int)
+    yoy = w.groupby(["Ano", "MesNum"])["OPPORTUNITY"].sum().reset_index()
+    yoy["Mês"] = yoy["MesNum"].map(lambda m: MESES_PT[m])
+    fig = px.line(yoy.sort_values("MesNum"), x="Mês", y="OPPORTUNITY", color="Ano",
+                  markers=True, category_orders={"Mês": MESES_PT[1:]})
+    fig.update_layout(title="Receita anual (R$) — ano a ano", height=380, yaxis_title="R$",
+                      margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def render_tsshara_bi(d, prod_f):
+    """Layout fiel ao BI (Superset) do cliente: RD Station, Em andamento,
+    Fechado, Conversão e Vendas brutas — mesma disposição das informações."""
+    won = d[d["Situação"] == "Ganho"]
+    lost = d[d["Situação"] == "Perdido"]
+    opend = d[d["Situação"] == "Aberto"]
+    total = len(d)
+    vc = d["Classe"].value_counts() if "Classe" in d.columns else pd.Series(dtype=int)
+    em_qual = int(vc.get("Lead", 0))
+    qualif = int(vc.get("Negócio aberto", 0) + vc.get("Negócio perdido", 0) + vc.get("Negócio ganho", 0))
+    desq = int(vc.get("Lead desqualificado", 0))
+    neg_and = int(vc.get("Negócio aberto", 0))
+    neg_g, neg_p = len(won), int(vc.get("Negócio perdido", 0))
+    tcol = next((c for c in d.columns if c.startswith("Tempo")), None)
+    ciclo = won["Ciclo (dias)"].median() if len(won) else 0
+
+    t = st.tabs(["📡 RD Station", "⏳ Em andamento", "✅ Fechado", "🔄 Conversão", "💰 Vendas brutas"])
+
+    # ---------------- RD Station ----------------
+    with t[0]:
+        r = st.columns(6)
+        r[0].metric("Leads criados", fmt_int(total))
+        r[1].metric("Em qualificação", fmt_int(em_qual))
+        r[2].metric("Leads qualificados", fmt_int(qualif))
+        r[3].metric("Qualificados %", f"{(qualif/total*100) if total else 0:.1f}%")
+        r[4].metric("Desqualificados", fmt_int(desq))
+        tval = "—"
+        if tcol:
+            ts = pd.to_numeric(d[tcol], errors="coerce")
+            ts = ts[ts > 0].dropna()
+            tval = f"{ts.median():.0f}" if len(ts) else "—"
+        r[5].metric("Tempo atend. (mediana)", tval)
+        r2 = st.columns(5)
+        r2[0].metric("Negócios em andamento", fmt_int(neg_and))
+        r2[1].metric("Negócios ganhos", fmt_int(neg_g))
+        r2[2].metric("Negócios perdidos", fmt_int(neg_p))
+        r2[3].metric("Valor ganho", fmt_brl(won["OPPORTUNITY"].sum()))
+        r2[4].metric("Win rate", f"{(neg_g/(neg_g+neg_p)*100) if (neg_g+neg_p) else 0:.1f}%")
+        st.divider()
+        cc = st.columns(2)
+        count_donut(cc[0], d, "Canal", "Leads criados por canal")
+        count_donut(cc[1], d, "Fonte/Origem", "Leads criados por fonte/origem")
+        if "Campanha" in d.columns and d["Campanha"].notna().any():
+            ct = conversion_table(d, "Campanha")
+            ct = ct[ct["Campanha"].notna() & ct["Campanha"].astype(str).str.strip().ne("")]
+            if not ct.empty:
+                st.markdown("#### Leads criados por campanha")
+                st.dataframe(_conv_table_display(ct, "Campanha", "Campanha").head(40),
+                             width="stretch", hide_index=True)
+        cc2 = st.columns(2)
+        count_donut(cc2[0], lost, "MOTIVO", "Motivos de perda")
+        count_donut(cc2[1], d, "SEGMENTO", "Negócios criados por segmento")
+        st.markdown("#### Valor ganho por dimensão (R$)")
+        dd = st.columns(3)
+        won_donut(dd[0], d, "Campanha", "Campanha")
+        won_donut(dd[1], d, "Estado", "Estado")
+        won_donut(dd[2], d, "SEGMENTO", "Segmento")
+        dd2 = st.columns(2)
+        count_donut(dd2[0], won, "Estado", "Negócios ganhos por Estado")
+        count_donut(dd2[1], lost, "SEGMENTO", "Negócios perdidos por segmento")
+        st.markdown("#### Vendas por vendedor")
+        st.dataframe(_vendor_table(d), width="stretch", hide_index=True)
+        if prod_f is not None and not prod_f.empty:
+            render_produtos(prod_f)
+        if not lost.empty and "MOTIVO" in lost.columns:
+            lp = lost[lost["MOTIVO"].notna() & lost["MOTIVO"].astype(str).str.strip().ne("")]
+            if not lp.empty:
+                st.markdown("#### Motivos de perda por vendedor")
+                piv = pd.crosstab(lp["MOTIVO"], lp["Vendedor"])
+                piv = piv[piv.sum(axis=0).sort_values(ascending=False).head(12).index]
+                piv["Total"] = piv.sum(axis=1)
+                st.dataframe(piv.sort_values("Total", ascending=False), width="stretch")
+
+    # ---------------- Em andamento ----------------
+    with t[1]:
+        k = st.columns(4)
+        k[0].metric("Em andamento (R$)", fmt_brl(opend["OPPORTUNITY"].sum()))
+        k[1].metric("Em andamento (qtd)", fmt_int(len(opend)))
+        k[2].metric("Média das negociações", fmt_brl(opend["OPPORTUNITY"].mean() if len(opend) else 0))
+        k[3].metric("Tempo médio (dias)", f"{ciclo:.0f}" if ciclo else "—")
+        st.markdown("#### Negócios criados por fonte")
+        st.dataframe(_val_table(d, "Fonte"), width="stretch", hide_index=True)
+        op = opend.dropna(subset=["CLOSEDATE"]).copy()
+        if not op.empty:
+            op["Mês prev."] = op["CLOSEDATE"].dt.to_period("M").astype(str)
+            fc = (op.groupby("Mês prev.").agg(Negócios=("ID", "count"),
+                  Valor=("OPPORTUNITY", "sum")).reset_index())
+            fc = fc[fc["Mês prev."] != "NaT"].sort_values("Mês prev.")
+            figf = go.Figure()
+            figf.add_bar(x=fc["Mês prev."], y=fc["Negócios"], name="Negócios", marker_color=OPEN_COLOR)
+            figf.add_trace(go.Scatter(x=fc["Mês prev."], y=fc["Valor"], name="Valor (R$)", yaxis="y2",
+                                      mode="lines+markers", line=dict(color=WON_COLOR)))
+            figf.update_layout(title="Negócios por data de fechamento prevista", height=380,
+                               yaxis=dict(title="Negócios"),
+                               yaxis2=dict(title="R$", overlaying="y", side="right", showgrid=False),
+                               margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(figf, width="stretch")
+        st.markdown("#### Informações gerais (em andamento)")
+        info = opend[["TITLE", "OPPORTUNITY", "Vendedor", "Fonte", "Estágio"]].copy()
+        info["OPPORTUNITY"] = info["OPPORTUNITY"].map(fmt_brl)
+        info.columns = ["Título", "Valor", "Responsável", "Fonte", "Fase"]
+        st.dataframe(info.head(200), width="stretch", hide_index=True)
+
+    # ---------------- Fechado ----------------
+    with t[2]:
+        fechados = d[d["Situação"].isin(["Ganho", "Perdido"])]
+        k = st.columns(4)
+        k[0].metric("Negócios ganhos (R$)", fmt_brl(won["OPPORTUNITY"].sum()))
+        k[1].metric("Negócios ganhos (qtd)", fmt_int(len(won)))
+        k[2].metric("Média de ganhos", fmt_brl(won["OPPORTUNITY"].mean() if len(won) else 0))
+        k[3].metric("Tempo médio negociação (dias)", f"{ciclo:.0f}" if ciclo else "—")
+        cc = st.columns(2)
+        cc[0].markdown("**Negócios fechados por fonte**")
+        cc[0].dataframe(_val_table(fechados, "Fonte"), width="stretch", hide_index=True)
+        if "Campanha" in d.columns:
+            cc[1].markdown("**Negócios fechados por campanha**")
+            cc[1].dataframe(_val_table(fechados, "Campanha").head(30), width="stretch", hide_index=True)
+
+    # ---------------- Conversão ----------------
+    with t[3]:
+        render_conversao(d)
+
+    # ---------------- Vendas brutas ----------------
+    with t[4]:
+        cc = st.columns(2)
+        cc[0].markdown("**Vendas por responsável (R$)**")
+        cc[0].dataframe(_val_table(won, "Vendedor"), width="stretch", hide_index=True)
+        cc[1].markdown("**Negócios ganhos por fonte (R$)**")
+        cc[1].dataframe(_val_table(won, "Fonte"), width="stretch", hide_index=True)
+        if "Campanha" in d.columns:
+            st.markdown("**Negócios ganhos por campanha (R$)**")
+            st.dataframe(_val_table(won, "Campanha").head(30), width="stretch", hide_index=True)
+        figy = _yoy_revenue(won)
+        if figy is not None:
+            st.plotly_chart(figy, width="stretch")
+        st.markdown("#### Negócios (ganhos)")
+        ng = won[["ID", "Fonte", "Estágio", "OPPORTUNITY", "TITLE"]].copy()
+        ng["OPPORTUNITY"] = ng["OPPORTUNITY"].map(fmt_brl)
+        ng.columns = ["id", "Fonte", "Fase", "Valor", "Título"]
+        st.dataframe(ng.head(300), width="stretch", hide_index=True)
 
 
 # ====================================================================== login
@@ -479,6 +682,11 @@ def render_dashboard(tenant: dict, user: dict):
         taxa_geral = (neg_ganho / total_leads * 100) if total_leads else 0     # lead -> ganho
         win_rate = (neg_ganho / (neg_ganho + neg_perd) * 100) if (neg_ganho + neg_perd) else 0
         valor_aberto = deals_f.loc[deals_f["Classe"] == "Negócio aberto", "OPPORTUNITY"].sum()
+
+    # layout fiel ao BI do cliente (mesma disposição das informações)
+    if fmap.get("bi_layout") and leads_in_deals:
+        render_tsshara_bi(deals_f, prod_f)
+        return
 
     st.subheader("Indicadores-chave")
     r1 = st.columns(4)
